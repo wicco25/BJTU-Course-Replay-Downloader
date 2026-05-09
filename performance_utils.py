@@ -1,6 +1,7 @@
 """Small runtime helpers for keeping UI/network work lean."""
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -22,6 +23,40 @@ class MemoryCache:
 
     def clear(self):
         self._values.clear()
+
+
+class ProgressThrottler:
+    """Decide when a progress update is worth emitting to the UI."""
+
+    def __init__(self, min_interval=0.3, min_delta=0.01, clock=None):
+        self.min_interval = min_interval
+        self.min_delta = min_delta
+        self.clock = clock or time.monotonic
+        self._last_time = None
+        self._last_value = None
+
+    def should_emit(self, value, force=False):
+        if force:
+            self._remember(value)
+            return True
+        now = self.clock()
+        if self._last_value is None:
+            self._last_time = now
+            self._last_value = value
+            return True
+        if value >= 1.0:
+            self._remember(value, now)
+            return True
+        if value - self._last_value < self.min_delta:
+            return False
+        if now - self._last_time < self.min_interval:
+            return False
+        self._remember(value, now)
+        return True
+
+    def _remember(self, value, now=None):
+        self._last_time = self.clock() if now is None else now
+        self._last_value = value
 
 
 def bounded_worker_count(requested, total, default=4, lower=1, upper=5):

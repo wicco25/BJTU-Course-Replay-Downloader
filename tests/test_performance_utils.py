@@ -4,6 +4,7 @@ from pathlib import Path
 
 from performance_utils import (
     MemoryCache,
+    ProgressThrottler,
     bounded_worker_count,
     is_complete_file,
     prefetch_stream_infos,
@@ -20,6 +21,27 @@ class MemoryCacheTests(unittest.TestCase):
         self.assertTrue(cache.has("empty-list"))
         self.assertEqual(cache.get("empty-list"), [])
         self.assertFalse(cache.has("missing"))
+
+
+class ProgressThrottlerTests(unittest.TestCase):
+    def test_throttler_emits_first_and_suppresses_tiny_updates(self):
+        current = [0.0]
+        throttler = ProgressThrottler(
+            min_interval=1.0,
+            min_delta=0.1,
+            clock=lambda: current[0],
+        )
+
+        self.assertTrue(throttler.should_emit(0.0))
+        current[0] = 2.0
+        self.assertFalse(throttler.should_emit(0.05))
+        self.assertTrue(throttler.should_emit(0.2))
+
+    def test_throttler_always_emits_completion(self):
+        throttler = ProgressThrottler(min_interval=999, min_delta=999)
+
+        self.assertTrue(throttler.should_emit(0.0))
+        self.assertTrue(throttler.should_emit(1.0))
 
 
 class StreamPrefetchTests(unittest.TestCase):

@@ -37,6 +37,7 @@ from summarizer import Summarizer
 from config import load_config, save_config
 from performance_utils import (
     MemoryCache,
+    ProgressThrottler,
     bounded_worker_count,
     is_complete_file,
     prefetch_stream_infos,
@@ -125,6 +126,7 @@ class CrawlerWorker(QThread):
 
         progress_lock = threading.Lock()
         item_progress = [0.0] * total
+        progress_throttlers = [ProgressThrottler() for _ in items]
         download_workers = bounded_worker_count(
             dl.cfg.get("download_workers", 2), total, default=2, upper=3
         )
@@ -134,6 +136,8 @@ class CrawlerWorker(QThread):
             with progress_lock:
                 item_progress[idx] = max(item_progress[idx], pct)
                 overall = int(sum(item_progress) / total * 100)
+            if not progress_throttlers[idx].should_emit(pct, force=pct >= 1.0):
+                return
             self.signals.progress.emit(
                 overall, f"[{idx+1}/{total}] 下载中 {int(pct * 100)}%"
             )
