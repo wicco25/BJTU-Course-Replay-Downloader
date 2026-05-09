@@ -311,6 +311,7 @@ class MainWindow(QMainWindow):
         self.semester_cache = MemoryCache()
         self.course_cache = MemoryCache()
         self.calendar_cache = MemoryCache()
+        self._active_task_rows = []
         self._init_ui()
         self._load_semesters()
 
@@ -395,9 +396,20 @@ class MainWindow(QMainWindow):
         ])
         slayout.addWidget(QLabel("选择画面:"), 0, 0)
         slayout.addWidget(self.stream_combo, 0, 1)
-        self.audio_only_cb = QCheckBox("仅下载音频(m4a)")
-        self.audio_only_cb.stateChanged.connect(self._update_download_button_text)
-        slayout.addWidget(self.audio_only_cb, 1, 0, 1, 2)
+        self.video_format_cb = QCheckBox("视频 MP4")
+        self.video_format_cb.setChecked(bool(self.cfg.get("download_video_format", True)))
+        self.video_format_cb.stateChanged.connect(self._on_download_format_changed)
+        slayout.addWidget(self.video_format_cb, 1, 0)
+        self.audio_format_cb = QCheckBox("音频 M4A")
+        self.audio_format_cb.setChecked(bool(self.cfg.get("download_audio_format", False)))
+        self.audio_format_cb.stateChanged.connect(self._on_download_format_changed)
+        slayout.addWidget(self.audio_format_cb, 1, 1)
+        format_tip = QLabel(
+            "可同时勾选视频和音频。音频会从同一个 m3u8 流中本地抽取，"
+            "不会使用 ffmpeg 的 audio-only 拉流参数。"
+        )
+        format_tip.setWordWrap(True)
+        slayout.addWidget(format_tip, 2, 0, 1, 2)
         dl_layout.addWidget(sg)
 
         # 路径
@@ -425,6 +437,7 @@ class MainWindow(QMainWindow):
         self.dl_audio_btn.setEnabled(False)
         self.dl_audio_btn.hide()
         dl_layout.addLayout(bl)
+        self._update_download_button_text()
 
         # 进度
         self.progress_bar = QProgressBar()
@@ -590,6 +603,25 @@ class MainWindow(QMainWindow):
         sf2.addRow("转写输出目录:", tdr)
         self.session_id_edit = QLineEdit(self.cfg.get("session_id", ""))
         sf2.addRow("Session ID:", self.session_id_edit)
+        perf_note = QLabel(
+            "下载性能设置说明：分片并发数影响单个 m3u8 的下载速度，建议 16，"
+            "网络好可试 24-32；分片重试次数建议 3；批量下载并发数建议 2，"
+            "最多 3，过高可能被平台限速；流信息预取并发数建议 4。"
+        )
+        perf_note.setWordWrap(True)
+        sf2.addRow("性能优化:", perf_note)
+        self.segment_workers_edit = QLineEdit(str(self.cfg.get("segment_workers", 16)))
+        self.segment_workers_edit.setPlaceholderText("建议 16，可试 24-32")
+        sf2.addRow("分片并发数:", self.segment_workers_edit)
+        self.segment_retries_edit = QLineEdit(str(self.cfg.get("segment_retries", 3)))
+        self.segment_retries_edit.setPlaceholderText("建议 3")
+        sf2.addRow("分片重试次数:", self.segment_retries_edit)
+        self.download_workers_edit = QLineEdit(str(self.cfg.get("download_workers", 2)))
+        self.download_workers_edit.setPlaceholderText("建议 2，最多 3")
+        sf2.addRow("批量下载并发数:", self.download_workers_edit)
+        self.prefetch_workers_edit = QLineEdit(str(self.cfg.get("stream_prefetch_workers", 4)))
+        self.prefetch_workers_edit.setPlaceholderText("建议 4")
+        sf2.addRow("流信息预取并发数:", self.prefetch_workers_edit)
         st_layout.addLayout(sf2)
         save_btn = QPushButton("保存设置")
         save_btn.clicked.connect(self._save_settings)
@@ -711,18 +743,61 @@ class MainWindow(QMainWindow):
         return keys[self.stream_combo.currentIndex()]
 
     def _update_download_button_text(self, *_):
-        if self.audio_only_cb.isChecked():
-            self.dl_btn.setText("下载选中音频")
+        formats = self._selected_download_formats(save=False)
+        labels = [fmt["label"] for fmt in formats]
+        if labels:
+            self.dl_btn.setText("下载选中" + "+".join(labels))
         else:
-            self.dl_btn.setText("下载选中视频")
+            self.dl_btn.setText("请选择下载格式")
+
+    def _on_download_format_changed(self, *_):
+        self._update_download_button_text()
+        self._save_download_format_preferences()
+
+    def _save_download_format_preferences(self):
+        self.cfg["download_video_format"] = self.video_format_cb.isChecked()
+        self.cfg["download_audio_format"] = self.audio_format_cb.isChecked()
+        save_config(self.cfg)
+
+    def _selected_download_formats(self, save=True):
+        formats = []
+        if self.video_format_cb.isChecked():
+            formats.append({
+                "kind": "video",
+                "label": "视频",
+                "ext": "mp4",
+                "audio_only": False,
+            })
+        if self.audio_format_cb.isChecked():
+            formats.append({
+                "kind": "audio",
+                "label": "音频",
+                "ext": "m4a",
+                "audio_only": True,
+            })
+        if save:
+            self._save_download_format_preferences()
+        return formats
 
     def _start_download_from_options(self):
-        self._start_batch_download(audio_only=self.audio_only_cb.isChecked())
+        self._start_batch_download()
 
-    def _start_batch_download(self, audio_only=False):
+    def _start_batch_download(self, audio_only=None):
         selected = self.replay_list.selectedItems()
         if not selected or not self.current_course:
             QMessageBox.warning(self, "提示", "请先选择课程和至少一次回放")
+            return
+        if audio_only is True:
+            formats = [{
+                "kind": "audio",
+                "label": "音频",
+                "ext": "m4a",
+                "audio_only": True,
+            }]
+        else:
+            formats = self._selected_download_formats()
+        if not formats:
+            QMessageBox.warning(self, "提示", "请至少勾选一种下载格式：视频 MP4 或音频 M4A")
             return
 
         co = self.current_course
@@ -734,32 +809,40 @@ class MainWindow(QMainWindow):
         self.cfg["download_dir"] = save_dir
         self.download_dir_edit.setText(save_dir)
         save_config(self.cfg)
-        ext = "m4a" if audio_only else "mp4"
 
         items = []
+        self._active_task_rows = []
         self.task_tree.clear()
         for item in selected:
             sched = item.data(Qt.UserRole)
             time_str = sched.get("courseBetween", "").replace(":", "").replace(" ", "_")
-            filename = f"{safe_name}_{time_str}_{stream_label}.{ext}"
-            output_path = os.path.join(save_dir, filename)
+            for fmt in formats:
+                filename = f"{safe_name}_{time_str}_{stream_label}_{fmt['label']}.{fmt['ext']}"
+                output_path = os.path.join(save_dir, filename)
 
-            twi = QTreeWidgetItem(["等待", filename, sched.get("courseBetween", "")])
-            twi.setData(0, Qt.UserRole, output_path)
-            self.task_tree.addTopLevelItem(twi)
+                twi = QTreeWidgetItem([
+                    "等待",
+                    filename,
+                    f"{sched.get('courseBetween', '')} | {fmt['label']}",
+                ])
+                twi.setData(0, Qt.UserRole, output_path)
+                self.task_tree.addTopLevelItem(twi)
+                task_row = self.task_tree.topLevelItemCount() - 1
 
-            if is_complete_file(output_path):
-                twi.setText(0, "已存在")
-                twi.setTextColor(0, Qt.darkGreen)
-                _downloaded_files.append(output_path)
-                continue
+                if is_complete_file(output_path):
+                    twi.setText(0, "已存在")
+                    twi.setTextColor(0, Qt.darkGreen)
+                    _downloaded_files.append(output_path)
+                    continue
 
-            items.append({
-                "sched_id": sched["id"],
-                "label": time_str,
-                "output_path": output_path,
-                "audio_only": audio_only,
-            })
+                self._active_task_rows.append(task_row)
+                items.append({
+                    "sched_id": sched["id"],
+                    "label": time_str,
+                    "output_path": output_path,
+                    "audio_only": fmt["audio_only"],
+                    "format_kind": fmt["kind"],
+                })
 
         if not items:
             self._log("选中文件均已存在，跳过下载")
@@ -767,7 +850,8 @@ class MainWindow(QMainWindow):
             self._refresh_audio_list()
             return
 
-        self._log(f"开始批量{'音频' if audio_only else '视频'}下载: {len(items)} 个任务")
+        format_names = "+".join(fmt["label"] for fmt in formats)
+        self._log(f"开始批量{format_names}下载: {len(items)} 个任务")
         self.dl_btn.setEnabled(False)
         self.dl_audio_btn.setEnabled(False)
         self.progress_bar.setValue(0)
@@ -781,25 +865,33 @@ class MainWindow(QMainWindow):
                          _item_fail=self._on_item_fail)
 
     def _on_item_start(self, idx, message):
-        if idx < self.task_tree.topLevelItemCount():
-            twi = self.task_tree.topLevelItem(idx)
+        row = self._task_row_for_worker_index(idx)
+        if row < self.task_tree.topLevelItemCount():
+            twi = self.task_tree.topLevelItem(row)
             twi.setText(0, message)
 
     def _on_item_done(self, idx, path):
-        if idx < self.task_tree.topLevelItemCount():
-            twi = self.task_tree.topLevelItem(idx)
+        row = self._task_row_for_worker_index(idx)
+        if row < self.task_tree.topLevelItemCount():
+            twi = self.task_tree.topLevelItem(row)
             twi.setText(0, "完成")
             twi.setForeground(0, QFont("", -1, -1, QFont.Bold).weight if False else Qt.darkGreen)
             twi.setTextColor(0, Qt.darkGreen)
         self._log(f"  [{idx+1}] 完成: {os.path.basename(path)}")
 
     def _on_item_fail(self, idx, reason):
-        if idx < self.task_tree.topLevelItemCount():
-            twi = self.task_tree.topLevelItem(idx)
+        row = self._task_row_for_worker_index(idx)
+        if row < self.task_tree.topLevelItemCount():
+            twi = self.task_tree.topLevelItem(row)
             twi.setText(0, "失败")
             twi.setTextColor(0, Qt.red)
             twi.setText(2, reason)
         self._log(f"  [{idx+1}] 失败: {reason}")
+
+    def _task_row_for_worker_index(self, idx):
+        if 0 <= idx < len(self._active_task_rows):
+            return self._active_task_rows[idx]
+        return idx
 
     def _on_batch_dl_done(self, data):
         self._log("批量下载结束")
@@ -1106,11 +1198,24 @@ class MainWindow(QMainWindow):
         self.log_text.append(f"[{ts}] {msg}")
 
     def _save_settings(self):
+        def read_int(widget, default, lower, upper):
+            try:
+                value = int(widget.text())
+            except ValueError:
+                value = default
+            return max(lower, min(upper, value))
+
         self.cfg["cookie_file"] = self.cookie_edit.text()
         self.cfg["download_dir"] = self.download_dir_edit.text()
         self.cfg["audio_dir"] = self.settings_audio_dir_edit.text()
         self.cfg["transcript_dir"] = self.settings_tr_dir_edit.text()
         self.cfg["session_id"] = self.session_id_edit.text()
+        self.cfg["segment_workers"] = read_int(self.segment_workers_edit, 16, 4, 32)
+        self.cfg["segment_retries"] = read_int(self.segment_retries_edit, 3, 0, 8)
+        self.cfg["download_workers"] = read_int(self.download_workers_edit, 2, 1, 3)
+        self.cfg["stream_prefetch_workers"] = read_int(self.prefetch_workers_edit, 4, 1, 8)
+        self.cfg["download_video_format"] = self.video_format_cb.isChecked()
+        self.cfg["download_audio_format"] = self.audio_format_cb.isChecked()
         self.cfg["api_key"] = self.api_key_edit.text()
         self.cfg["api_base_url"] = self.api_url_edit.text()
         self.cfg["api_model"] = self.api_model_edit.text()

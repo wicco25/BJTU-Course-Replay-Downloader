@@ -20,6 +20,13 @@ DEFAULT_CONFIG = {
     "whisper_device": "auto",
     "whisper_language": "zh",
     "fast_download_progress": True,
+    "parallel_hls_download": True,
+    "segment_workers": 16,
+    "segment_retries": 3,
+    "stream_prefetch_workers": 4,
+    "download_workers": 2,
+    "download_video_format": True,
+    "download_audio_format": False,
 }
 
 CONFIG_FILE = os.path.join(BASE_DIR, "settings.json")

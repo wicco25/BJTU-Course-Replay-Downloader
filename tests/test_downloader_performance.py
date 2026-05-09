@@ -35,5 +35,55 @@ class DownloadDurationTests(unittest.TestCase):
         probe.assert_called_once()
 
 
+class ParallelDownloadTests(unittest.TestCase):
+    def test_video_download_prefers_parallel_hls(self):
+        downloader = VideoDownloader(FakeCrawler())
+        downloader.cfg["parallel_hls_download"] = True
+
+        with patch.object(
+            downloader, "_download_hls_parallel", return_value="out.mp4"
+        ) as parallel, patch.object(downloader, "_download_with_ffmpeg") as ffmpeg:
+            result = downloader.download_m3u8("http://example/lesson.m3u8", "downloads/out.mp4")
+
+        self.assertEqual(result, "out.mp4")
+        parallel.assert_called_once()
+        self.assertEqual(parallel.call_args.kwargs["media_kind"], "video")
+        ffmpeg.assert_not_called()
+
+    def test_video_download_falls_back_to_ffmpeg(self):
+        downloader = VideoDownloader(FakeCrawler())
+        downloader.cfg["parallel_hls_download"] = True
+
+        with patch.object(
+            downloader, "_download_hls_parallel", return_value=None
+        ) as parallel, patch.object(
+            downloader, "_download_with_ffmpeg", return_value="fallback.mp4"
+        ) as ffmpeg:
+            result = downloader.download_m3u8("http://example/lesson.m3u8", "downloads/out.mp4")
+
+        self.assertEqual(result, "fallback.mp4")
+        parallel.assert_called_once()
+        ffmpeg.assert_called_once()
+
+    def test_audio_download_uses_parallel_hls_audio_mode(self):
+        downloader = VideoDownloader(FakeCrawler())
+
+        with patch.object(
+            downloader, "_download_hls_parallel", return_value="out.m4a"
+        ) as parallel, patch.object(downloader, "_download_audio_with_ffmpeg") as ffmpeg:
+            result = downloader.download_audio_only("http://example/lesson.m3u8", "audio/out.m4a")
+
+        self.assertEqual(result, "out.m4a")
+        self.assertEqual(parallel.call_args.kwargs["media_kind"], "audio")
+        ffmpeg.assert_not_called()
+
+    def test_segment_workers_are_bounded(self):
+        downloader = VideoDownloader(FakeCrawler())
+        downloader.cfg["segment_workers"] = 99
+
+        self.assertEqual(downloader._bounded_segment_workers(100), 32)
+        self.assertEqual(downloader._bounded_segment_workers(2), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ import os
 import subprocess
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 
@@ -36,6 +37,14 @@ class VideoDownloader:
         优先使用ffmpeg直接下载，失败时回退到手动下载ts分片合并。
         """
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        if self.cfg.get("parallel_hls_download", True):
+            result = self._download_hls_parallel(
+                m3u8_url, output_path, media_kind="video",
+                progress_callback=progress_callback,
+            )
+            if result:
+                return result
+            print("[Downloader] parallel video download failed, fallback to ffmpeg")
         return self._download_with_ffmpeg(m3u8_url, output_path, progress_callback)
 
     def _download_with_ffmpeg(self, m3u8_url, output_path, progress_callback=None):
@@ -111,7 +120,10 @@ class VideoDownloader:
 
     def download_audio_only(self, m3u8_url, audio_path, progress_callback=None):
         """直接从m3u8拷贝音频流（跳过视频下载步骤）"""
-        result = self._download_audio_parallel(m3u8_url, audio_path, progress_callback)
+        result = self._download_hls_parallel(
+            m3u8_url, audio_path, media_kind="audio",
+            progress_callback=progress_callback,
+        )
         if result:
             return result
         print("[Downloader] 并发音频下载失败，回退到ffmpeg顺序下载")
@@ -158,6 +170,14 @@ class VideoDownloader:
 
     def _download_audio_parallel(self, m3u8_url, audio_path, progress_callback=None):
         """并发下载HLS分片到本地，再用ffmpeg抽取音频流。"""
+        return self._download_hls_parallel(
+            m3u8_url, audio_path, media_kind="audio",
+            progress_callback=progress_callback,
+        )
+
+    def _download_hls_parallel(self, m3u8_url, output_path, media_kind,
+                               progress_callback=None):
+        """Download simple HLS segments concurrently, then remux locally."""
         content = self.crawler.get_m3u8_content(m3u8_url)
         if not content:
             return None
@@ -171,9 +191,11 @@ class VideoDownloader:
             return None
         if any("#EXT-X-KEY" in line for line in lines):
             return None
+        if any(line.lstrip().startswith("#EXT-X-MAP") for line in lines):
+            return None
 
-        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-        temp_dir = audio_path + ".parts"
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        temp_dir = output_path + ".parts"
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
         os.makedirs(temp_dir, exist_ok=True)
@@ -185,8 +207,7 @@ class VideoDownloader:
             segment_urls = [urljoin(m3u8_url, segment) for segment in segment_lines]
             total = len(segment_urls)
             done = 0
-            workers = int(self.cfg.get("segment_workers", 16))
-            workers = min(32, max(4, workers))
+            workers = self._bounded_segment_workers(total)
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [
@@ -204,21 +225,21 @@ class VideoDownloader:
                         progress_callback(min(done / total * 0.9, 0.9))
 
             playlist_path = os.path.join(temp_dir, "playlist.m3u8")
-            seg_idx = 0
-            with open(playlist_path, "w", encoding="utf-8", newline="\n") as f:
-                for raw_line in lines:
-                    stripped = raw_line.strip()
-                    if stripped and not stripped.startswith("#"):
-                        f.write(segment_names[seg_idx] + "\n")
-                        seg_idx += 1
-                    else:
-                        f.write(raw_line + "\n")
+            self._write_local_playlist(playlist_path, lines, segment_names)
 
-            result = self._extract_audio_from_local_playlist(
-                playlist_path, audio_path,
-                lambda pct: progress_callback(0.9 + pct * 0.1)
-                if progress_callback else None,
-            )
+            if media_kind == "audio":
+                result = self._extract_audio_from_local_playlist(
+                    playlist_path, output_path,
+                    lambda pct: progress_callback(0.9 + pct * 0.1)
+                    if progress_callback else None,
+                )
+            else:
+                result = self._remux_video_from_local_playlist(
+                    playlist_path, output_path,
+                    lambda pct: progress_callback(0.9 + pct * 0.1)
+                    if progress_callback else None,
+                )
+
             if result:
                 if progress_callback:
                     progress_callback(1.0)
@@ -227,14 +248,58 @@ class VideoDownloader:
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def _write_local_playlist(self, playlist_path, lines, segment_names):
+        seg_idx = 0
+        with open(playlist_path, "w", encoding="utf-8", newline="\n") as f:
+            for raw_line in lines:
+                stripped = raw_line.strip()
+                if stripped and not stripped.startswith("#"):
+                    f.write(segment_names[seg_idx] + "\n")
+                    seg_idx += 1
+                else:
+                    f.write(raw_line + "\n")
+
+    def _bounded_segment_workers(self, total):
+        try:
+            workers = int(self.cfg.get("segment_workers", 16))
+        except (TypeError, ValueError):
+            workers = 16
+        workers = min(32, max(4, workers))
+        return min(workers, max(total, 1))
+
+    def _segment_retries(self):
+        try:
+            retries = int(self.cfg.get("segment_retries", 3))
+        except (TypeError, ValueError):
+            retries = 3
+        return min(8, max(0, retries))
+
     def _download_segment(self, url, output_path):
         session = self._get_segment_session()
-        with session.get(url, stream=True, timeout=(10, 60)) as resp:
-            resp.raise_for_status()
-            with open(output_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 256):
-                    if chunk:
-                        f.write(chunk)
+        retries = self._segment_retries()
+        tmp_path = output_path + ".tmp"
+        last_error = None
+
+        for attempt in range(retries + 1):
+            try:
+                with session.get(url, stream=True, timeout=(10, 60)) as resp:
+                    resp.raise_for_status()
+                    with open(tmp_path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=1024 * 256):
+                            if chunk:
+                                f.write(chunk)
+                os.replace(tmp_path, output_path)
+                return
+            except Exception as exc:
+                last_error = exc
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
+                if attempt < retries:
+                    time.sleep(0.4 * (attempt + 1))
+        raise last_error
 
     def _get_segment_session(self):
         session = getattr(self._segment_local, "session", None)
@@ -282,6 +347,39 @@ class VideoDownloader:
             return None
         except FileNotFoundError:
             print("[Downloader] ffmpeg未找到")
+            return None
+
+    def _remux_video_from_local_playlist(self, playlist_path, output_path,
+                                         progress_callback=None):
+        duration = self._get_hls_duration(playlist_path)
+        cmd = [
+            "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+            "-allowed_extensions", "ALL",
+            "-protocol_whitelist", "file,crypto,data,pipe",
+            "-i", playlist_path,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            "-movflags", "+faststart",
+            "-f", "mp4",
+            "-progress", "pipe:1",
+            "-nostats",
+            output_path,
+        ]
+        try:
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1, env=_without_proxy_env()
+            )
+            for line in process.stdout:
+                self._emit_progress(line, duration, progress_callback)
+
+            process.wait()
+            if process.returncode == 0 and os.path.exists(output_path):
+                return output_path
+            print("[Downloader] local segment video remux failed")
+            return None
+        except FileNotFoundError:
+            print("[Downloader] ffmpeg not found")
             return None
 
     def merge_audio_video(self, video_path, audio_path, output_path):
