@@ -1,5 +1,6 @@
 """Small runtime helpers for keeping UI/network work lean."""
 
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -88,3 +89,11 @@ def run_limited_concurrent(items, worker, max_workers=2, upper=3):
             idx = future_map[future]
             results[idx] = future.result()
     return results
+
+
+def is_complete_file(path, min_bytes=1024 * 1024):
+    """Treat an existing non-trivial media file as already downloaded."""
+    try:
+        return bool(path) and os.path.isfile(path) and os.path.getsize(path) >= min_bytes
+    except OSError:
+        return False

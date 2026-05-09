@@ -38,6 +38,7 @@ from config import load_config, save_config
 from performance_utils import (
     MemoryCache,
     bounded_worker_count,
+    is_complete_file,
     prefetch_stream_infos,
     run_limited_concurrent,
 )
@@ -736,12 +737,24 @@ class MainWindow(QMainWindow):
             twi.setData(0, Qt.UserRole, output_path)
             self.task_tree.addTopLevelItem(twi)
 
+            if is_complete_file(output_path):
+                twi.setText(0, "已存在")
+                twi.setTextColor(0, Qt.darkGreen)
+                _downloaded_files.append(output_path)
+                continue
+
             items.append({
                 "sched_id": sched["id"],
                 "label": time_str,
                 "output_path": output_path,
                 "audio_only": audio_only,
             })
+
+        if not items:
+            self._log("选中文件均已存在，跳过下载")
+            self.progress_bar.setValue(100)
+            self._refresh_audio_list()
+            return
 
         self._log(f"开始批量{'音频' if audio_only else '视频'}下载: {len(items)} 个任务")
         self.dl_btn.setEnabled(False)

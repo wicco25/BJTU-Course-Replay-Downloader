@@ -1,8 +1,11 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 from performance_utils import (
     MemoryCache,
     bounded_worker_count,
+    is_complete_file,
     prefetch_stream_infos,
     run_limited_concurrent,
 )
@@ -46,6 +49,17 @@ class StreamPrefetchTests(unittest.TestCase):
         )
 
         self.assertEqual(results, ["0:a", "1:b", "2:c"])
+
+
+class FileCompletionTests(unittest.TestCase):
+    def test_complete_file_requires_existing_file_above_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "lesson.m4a"
+            path.write_bytes(b"12345")
+
+            self.assertTrue(is_complete_file(str(path), min_bytes=5))
+            self.assertFalse(is_complete_file(str(path), min_bytes=6))
+            self.assertFalse(is_complete_file(str(path.with_suffix(".missing"))))
 
 
 if __name__ == "__main__":
