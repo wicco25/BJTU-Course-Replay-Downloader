@@ -10,6 +10,7 @@
 
 import argparse
 import io
+import json
 import os
 import sys
 from typing import Dict
@@ -87,7 +88,7 @@ BASE_HEADERS = {
 }
 
 REQUEST_TIMEOUT = (5, 15)
-AUTH_REDIRECT_MARKERS = ("cas.bjtu.edu.cn", "/auth/login", "/auth/sso")
+DEFAULT_SESSION_ID = "9BEC92261A9FBC5ECF299C45D4C0468A"
 
 
 def _new_session() -> requests.Session:
@@ -117,15 +118,44 @@ def _write_cookie_file(cookie_path: str, cookies: Dict[str, str]):
     with open(tmp_path, "w", encoding="utf-8") as f:
         for key, value in cookies.items():
             f.write(f"{key}={value}\n")
-    os.replace(tmp_path, cookie_path)
+    try:
+        os.replace(tmp_path, cookie_path)
+    except PermissionError:
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            for key, value in cookies.items():
+                f.write(f"{key}={value}\n")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
-def _is_auth_redirect(location: str) -> bool:
-    lowered = (location or "").lower()
-    return any(marker in lowered for marker in AUTH_REDIRECT_MARKERS)
+def _request_probe_json(session: requests.Session, url: str,
+                        params: Dict[str, object],
+                        session_id: str) -> Dict[str, object]:
+    response = session.get(
+        url,
+        params=params,
+        headers={
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "sessionId": session_id,
+        },
+        allow_redirects=False,
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.is_redirect or response.is_permanent_redirect:
+        return {}
+    if response.status_code >= 400:
+        return {}
+    try:
+        return response.json()
+    except ValueError:
+        return {}
 
 
-def _probe_cookie_valid(cookie_path: str, base_url: str) -> Dict[str, str]:
+def _probe_cookie_valid(cookie_path: str, base_url: str,
+                        session_id: str = DEFAULT_SESSION_ID) -> Dict[str, str]:
     cookies = _load_cookie_file(cookie_path)
     if not cookies:
         return {}
@@ -133,18 +163,62 @@ def _probe_cookie_valid(cookie_path: str, base_url: str) -> Dict[str, str]:
     session = _new_session()
     session.cookies.update(cookies)
     try:
-        response = session.get(
-            base_url, allow_redirects=False, timeout=REQUEST_TIMEOUT
+        semester_url = (
+            f"{base_url.rstrip('/')}/back/rp/common/teachCalendar.shtml"
+        )
+        semester_data = _request_probe_json(
+            session, semester_url, {"method": "queryCurrentXq"}, session_id
         )
     except requests.RequestException:
         return {}
 
-    location = response.headers.get("Location", "")
-    if response.is_redirect or response.is_permanent_redirect:
-        return {} if _is_auth_redirect(location) else cookies
-    if response.status_code >= 400:
+    if semester_data.get("STATUS") != "0":
         return {}
-    return cookies
+    semesters = semester_data.get("result") or []
+    xq_code = ""
+    for semester in semesters:
+        if semester.get("currentFlag") == 2:
+            xq_code = semester.get("xqCode", "")
+            break
+    if not xq_code and semesters:
+        xq_code = semesters[0].get("xqCode", "")
+    if not xq_code:
+        return {}
+
+    try:
+        courses_url = f"{base_url.rstrip('/')}/back/coursePlatform/course.shtml"
+        course_data = _request_probe_json(
+            session,
+            courses_url,
+            {
+                "method": "getCourseList",
+                "pagesize": 1,
+                "page": 1,
+                "xqCode": xq_code,
+            },
+            session_id,
+        )
+    except requests.RequestException:
+        return {}
+    if course_data.get("STATUS") != "0":
+        return {}
+
+    refreshed = dict(cookies)
+    if hasattr(session.cookies, "get_dict"):
+        refreshed.update(session.cookies.get_dict())
+    else:
+        refreshed.update(dict(session.cookies))
+    return refreshed
+
+
+def _load_project_session_id(script_dir: str) -> str:
+    settings_path = os.path.normpath(os.path.join(script_dir, "..", "settings.json"))
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        return DEFAULT_SESSION_ID
+    return settings.get("session_id") or DEFAULT_SESSION_ID
 
 
 def _get_initial_page(session: requests.Session) -> requests.Response:
@@ -340,6 +414,11 @@ def main():
         help="课程平台地址（默认 http://123.121.147.7:88/ve）",
     )
     parser.add_argument(
+        "--session-id",
+        default=None,
+        help="课程平台 API 使用的 sessionId；默认读取项目 settings.json。",
+    )
+    parser.add_argument(
         "--force-login",
         action="store_true",
         help="Force a fresh CAS login instead of reusing an existing cookie.",
@@ -381,8 +460,9 @@ def main():
 
     # 执行登录
     root_cookie = os.path.join(script_dir, "..", "cookies.txt")
+    session_id = args.session_id or _load_project_session_id(script_dir)
     if not args.force_login:
-        cookies = _probe_cookie_valid(args.cookie, args.base_url)
+        cookies = _probe_cookie_valid(args.cookie, args.base_url, session_id)
         if cookies:
             _write_cookie_file(root_cookie, cookies)
             print(f"[Info] Existing cookie is valid, skipped CAS login: {args.cookie}")
@@ -402,8 +482,9 @@ def main():
     print(f"[信息] Cookie 已写入: {args.cookie}")
 
     # 同时替换根目录 cookies.txt
-    _write_cookie_file(root_cookie, cookies)
-    print(f"[信息] 已同步到根目录: {root_cookie}")
+    if os.path.abspath(args.cookie) != os.path.abspath(root_cookie):
+        _write_cookie_file(root_cookie, cookies)
+        print(f"[信息] 已同步到根目录: {root_cookie}")
 
 
 if __name__ == "__main__":

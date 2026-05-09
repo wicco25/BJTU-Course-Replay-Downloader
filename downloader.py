@@ -1,8 +1,10 @@
 """下载器模块 - 负责从m3u8/HLS流下载视频或提取音频"""
 
 import os
+import re
 import subprocess
 import shutil
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,6 +39,13 @@ class VideoDownloader:
         优先使用ffmpeg直接下载，失败时回退到手动下载ts分片合并。
         """
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        if self.cfg.get("use_ytdlp", True):
+            result = self._download_with_ytdlp(
+                m3u8_url, output_path, progress_callback
+            )
+            if result:
+                return result
+            print("[Downloader] yt-dlp video download failed, fallback to parallel HLS")
         if self.cfg.get("parallel_hls_download", True):
             result = self._download_hls_parallel(
                 m3u8_url, output_path, media_kind="video",
@@ -120,6 +129,13 @@ class VideoDownloader:
 
     def download_audio_only(self, m3u8_url, audio_path, progress_callback=None):
         """直接从m3u8拷贝音频流（跳过视频下载步骤）"""
+        if self.cfg.get("use_ytdlp", True):
+            result = self._download_audio_with_ytdlp(
+                m3u8_url, audio_path, progress_callback
+            )
+            if result:
+                return result
+            print("[Downloader] yt-dlp audio download failed, fallback to parallel HLS")
         result = self._download_hls_parallel(
             m3u8_url, audio_path, media_kind="audio",
             progress_callback=progress_callback,
@@ -174,6 +190,120 @@ class VideoDownloader:
             m3u8_url, audio_path, media_kind="audio",
             progress_callback=progress_callback,
         )
+
+    def _download_with_ytdlp(self, m3u8_url, output_path, progress_callback=None):
+        if progress_callback:
+            progress_callback(0)
+        cmd = self._build_ytdlp_cmd(m3u8_url, output_path)
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=_without_proxy_env(),
+            )
+            for line in process.stdout:
+                self._emit_ytdlp_progress(line, progress_callback)
+
+            process.wait()
+            if process.returncode == 0 and os.path.exists(output_path):
+                if progress_callback:
+                    progress_callback(1.0)
+                return output_path
+            return None
+        except FileNotFoundError:
+            return None
+
+    def _download_audio_with_ytdlp(self, m3u8_url, audio_path,
+                                   progress_callback=None):
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+        temp_video = audio_path + ".source.mp4"
+        try:
+            result = self._download_with_ytdlp(
+                m3u8_url,
+                temp_video,
+                lambda pct: progress_callback(pct * 0.9)
+                if progress_callback else None,
+            )
+            if not result:
+                return None
+            audio = self._extract_audio_from_media(
+                temp_video,
+                audio_path,
+                lambda pct: progress_callback(0.9 + pct * 0.1)
+                if progress_callback else None,
+            )
+            if audio and progress_callback:
+                progress_callback(1.0)
+            return audio
+        finally:
+            try:
+                if os.path.exists(temp_video):
+                    os.remove(temp_video)
+            except OSError:
+                pass
+
+    def _build_ytdlp_cmd(self, m3u8_url, output_path):
+        workers = self._bounded_segment_workers(999999)
+        cmd = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--newline",
+            "--no-playlist",
+            "--force-overwrites",
+            "--no-part",
+            "-N",
+            str(workers),
+            "--add-header",
+            f"sessionId:{self.crawler.session_id}",
+        ]
+        cookie_header = self._cookie_header()
+        if cookie_header:
+            cmd.extend(["--add-header", f"Cookie:{cookie_header}"])
+        cmd.extend(["-o", output_path, m3u8_url])
+        return cmd
+
+    def _cookie_header(self):
+        cookies = getattr(self.crawler.session, "cookies", {})
+        if hasattr(cookies, "get_dict"):
+            cookies = cookies.get_dict()
+        return "; ".join(
+            f"{key}={value}" for key, value in dict(cookies).items()
+        )
+
+    def _extract_audio_from_media(self, media_path, audio_path,
+                                  progress_callback=None):
+        duration = self._get_media_duration(media_path)
+        cmd = [
+            "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+            "-i", media_path,
+            "-map", "0:a:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            "-progress", "pipe:1",
+            "-nostats",
+            audio_path,
+        ]
+        try:
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1, env=_without_proxy_env()
+            )
+            for line in process.stdout:
+                self._emit_progress(line, duration, progress_callback)
+
+            process.wait()
+            if process.returncode == 0 and os.path.exists(audio_path):
+                return audio_path
+            return None
+        except FileNotFoundError:
+            return None
 
     def _download_hls_parallel(self, m3u8_url, output_path, media_kind,
                                progress_callback=None):
@@ -463,5 +593,17 @@ class VideoDownloader:
             us_val = int(line.split("=", 1)[1].strip())
             seconds = us_val / 1_000_000
             progress_callback(min(max(seconds / duration, 0), 0.999))
+        except ValueError:
+            pass
+
+    @staticmethod
+    def _emit_ytdlp_progress(line, progress_callback):
+        if not progress_callback:
+            return
+        match = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", line)
+        if not match:
+            return
+        try:
+            progress_callback(min(float(match.group(1)) / 100.0, 0.999))
         except ValueError:
             pass

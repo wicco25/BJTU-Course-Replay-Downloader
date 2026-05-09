@@ -3,9 +3,28 @@
 import requests
 import re
 import os
+import subprocess
+import sys
 import time
 from bs4 import BeautifulSoup
-from config import load_config, get_download_path
+from config import BASE_DIR, load_config, get_download_path
+
+
+AUTH_EXPIRED_MARKERS = (
+    "cas.bjtu.edu.cn",
+    "/auth/login",
+    "/auth/sso",
+    "login",
+    "session",
+    "expired",
+    "unauthorized",
+    "nullpointerexception",
+    "系统发生了未处理",
+    "登录",
+    "未登录",
+    "认证",
+    "过期",
+)
 
 
 class CourseCrawler:
@@ -16,6 +35,8 @@ class CourseCrawler:
         self.base_url = cfg["base_url"]
         self.session_id = cfg["session_id"]
         self.cookie_file = cfg["cookie_file"]
+        self.auto_relogin = cfg.get("auto_relogin", True)
+        self._relogin_attempted = False
         self.session = requests.Session()
         self.session.trust_env = False
         self.session.headers.update({
@@ -27,6 +48,7 @@ class CourseCrawler:
         self._load_cookies()
 
     def _load_cookies(self):
+        self.session.cookies.clear()
         if os.path.exists(self.cookie_file):
             with open(self.cookie_file, "r", encoding="utf-8") as f:
                 for line in f:
@@ -40,31 +62,101 @@ class CourseCrawler:
 
     def _api_get(self, path, params=None, extra_headers=None):
         """GET请求（JSON API）"""
-        url = f"{self.base_url}{path}"
-        headers = {"sessionId": self.session_id}
-        if extra_headers:
-            headers.update(extra_headers)
-        try:
-            resp = self.session.get(url, params=params, headers=headers, timeout=30)
-            resp.encoding = "utf-8"
-            return resp.json() if resp.text else {}
-        except Exception as e:
-            print(f"[Crawler] GET {url} 失败: {e}")
-            return {}
+        return self._request_json("GET", path, params=params,
+                                  extra_headers=extra_headers)
 
     def _api_post(self, path, data=None, extra_headers=None):
         """POST请求（JSON API）"""
+        return self._request_json("POST", path, data=data or {},
+                                  extra_headers=extra_headers)
+
+    def _request_json(self, method, path, params=None, data=None,
+                      extra_headers=None, allow_relogin=True):
         url = f"{self.base_url}{path}"
         headers = {"sessionId": self.session_id}
         if extra_headers:
             headers.update(extra_headers)
         try:
-            resp = self.session.post(url, data=data or {}, headers=headers, timeout=30)
+            if method == "POST":
+                resp = self.session.post(
+                    url, data=data or {}, headers=headers,
+                    timeout=30, allow_redirects=False,
+                )
+            else:
+                resp = self.session.get(
+                    url, params=params, headers=headers,
+                    timeout=30, allow_redirects=False,
+                )
             resp.encoding = "utf-8"
-            return resp.json() if resp.text else {}
+            try:
+                payload = resp.json() if resp.text else {}
+            except ValueError:
+                payload = None
+
+            if self._looks_auth_expired(resp, payload):
+                if allow_relogin and self._refresh_login():
+                    return self._request_json(
+                        method, path, params=params, data=data,
+                        extra_headers=extra_headers, allow_relogin=False,
+                    )
+                return {}
+            return payload or {}
         except Exception as e:
-            print(f"[Crawler] POST {url} 失败: {e}")
+            print(f"[Crawler] {method} {url} 失败: {e}")
             return {}
+
+    def _looks_auth_expired(self, resp, payload):
+        location = resp.headers.get("Location", "")
+        if resp.is_redirect or resp.is_permanent_redirect:
+            return True
+        if resp.status_code in (401, 403):
+            return True
+        if payload is not None:
+            text = " ".join(
+                str(payload.get(key, ""))
+                for key in ("MSG", "msg", "message", "error")
+            ).lower()
+            return any(marker.lower() in text for marker in AUTH_EXPIRED_MARKERS)
+        text = f"{location}\n{resp.text[:1000]}".lower()
+        return any(marker.lower() in text for marker in AUTH_EXPIRED_MARKERS)
+
+    def _refresh_login(self):
+        if not self.auto_relogin or self._relogin_attempted:
+            return False
+        self._relogin_attempted = True
+        script = os.path.join(BASE_DIR, "standalone-login", "login.py")
+        if not os.path.exists(script):
+            print(f"[Crawler] 自动登录脚本不存在: {script}")
+            return False
+
+        cmd = [
+            sys.executable,
+            script,
+            "--cookie",
+            self.cookie_file,
+            "--base-url",
+            self.base_url,
+            "--session-id",
+            self.session_id,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=os.path.dirname(script),
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except Exception as e:
+            print(f"[Crawler] 自动重新登录失败: {e}")
+            return False
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            print(f"[Crawler] 自动重新登录失败: {detail}")
+            return False
+        print("[Crawler] 自动重新登录成功，已重新加载 Cookie")
+        self._load_cookies()
+        return True
 
     def _get_page(self, path, params=None):
         """获取HTML页面"""
