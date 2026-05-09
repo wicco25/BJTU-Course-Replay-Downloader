@@ -6,6 +6,7 @@ from performance_utils import (
     MemoryCache,
     ProgressThrottler,
     bounded_worker_count,
+    is_audio_file,
     is_complete_file,
     prefetch_stream_infos,
     run_limited_concurrent,
@@ -82,6 +83,11 @@ class FileCompletionTests(unittest.TestCase):
             self.assertTrue(is_complete_file(str(path), min_bytes=5))
             self.assertFalse(is_complete_file(str(path), min_bytes=6))
             self.assertFalse(is_complete_file(str(path.with_suffix(".missing"))))
+
+    def test_audio_file_detection_is_extension_based(self):
+        self.assertTrue(is_audio_file("lesson.M4A"))
+        self.assertTrue(is_audio_file("lecture.mp3"))
+        self.assertFalse(is_audio_file("lecture.mp4"))
 
 
 if __name__ == "__main__":

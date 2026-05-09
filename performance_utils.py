@@ -132,3 +132,7 @@ def is_complete_file(path, min_bytes=1024 * 1024):
         return bool(path) and os.path.isfile(path) and os.path.getsize(path) >= min_bytes
     except OSError:
         return False
+
+
+def is_audio_file(path):
+    return str(path).lower().endswith((".mp3", ".wav", ".m4a", ".flac", ".aac"))

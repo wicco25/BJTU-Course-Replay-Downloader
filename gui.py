@@ -39,6 +39,7 @@ from performance_utils import (
     MemoryCache,
     ProgressThrottler,
     bounded_worker_count,
+    is_audio_file,
     is_complete_file,
     prefetch_stream_infos,
     run_limited_concurrent,
@@ -127,6 +128,8 @@ class CrawlerWorker(QThread):
         progress_lock = threading.Lock()
         item_progress = [0.0] * total
         progress_throttlers = [ProgressThrottler() for _ in items]
+        completed_paths = []
+        completed_lock = threading.Lock()
         download_workers = bounded_worker_count(
             dl.cfg.get("download_workers", 2), total, default=2, upper=3
         )
@@ -181,6 +184,8 @@ class CrawlerWorker(QThread):
 
                 if result:
                     _downloaded_files.append(result)
+                    with completed_lock:
+                        completed_paths.append(result)
                     self.signals.item_done.emit(i, result)
                     update_progress(i, 1.0)
                     return result
@@ -198,6 +203,7 @@ class CrawlerWorker(QThread):
         self.signals.finished.emit({
             "batch": "download_complete",
             "audio_only": audio_only_batch,
+            "downloaded_files": completed_paths,
         })
         return
 
@@ -799,7 +805,7 @@ class MainWindow(QMainWindow):
         self.dl_btn.setEnabled(True)
         self.dl_audio_btn.setEnabled(True)
         self._mark_downloaded()
-        self._refresh_audio_list()
+        self._append_audio_files(data.get("downloaded_files", []))
         if data.get("audio_only") and self.tr_file_list.count() > 0:
             self._log("音频已加入转写列表")
             self.tabs.setCurrentIndex(1)
@@ -877,7 +883,7 @@ class MainWindow(QMainWindow):
         for d in dirs_to_scan:
             for root, _, files in os.walk(d):
                 for f in files:
-                    if f.lower().endswith((".mp3", ".wav", ".m4a", ".flac", ".aac")):
+                    if is_audio_file(f):
                         full = os.path.join(root, f)
                         if full not in seen:
                             seen.add(full)
@@ -888,6 +894,26 @@ class MainWindow(QMainWindow):
         self._log(f"扫描到 {self.tr_file_list.count()} 个音频文件")
         if self.tr_file_list.count() > 0:
             self.tr_file_list.setCurrentRow(0)
+
+    def _append_audio_files(self, paths):
+        if not paths:
+            return
+        existing = {
+            self.tr_file_list.item(i).data(Qt.UserRole)
+            for i in range(self.tr_file_list.count())
+        }
+        added = 0
+        for full in paths:
+            if not is_audio_file(full) or full in existing:
+                continue
+            item = QListWidgetItem(os.path.basename(full))
+            item.setData(Qt.UserRole, full)
+            self.tr_file_list.addItem(item)
+            existing.add(full)
+            added += 1
+        if added:
+            self._log(f"新增 {added} 个音频文件到转写列表")
+            self.tr_file_list.setCurrentRow(self.tr_file_list.count() - 1)
 
     def _get_transcribe_files(self):
         """获取待转写的文件列表"""
