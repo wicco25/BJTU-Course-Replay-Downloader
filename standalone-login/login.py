@@ -86,21 +86,83 @@ BASE_HEADERS = {
     ),
 }
 
+REQUEST_TIMEOUT = (5, 15)
+AUTH_REDIRECT_MARKERS = ("cas.bjtu.edu.cn", "/auth/login", "/auth/sso")
+
+
+def _new_session() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update(BASE_HEADERS)
+    return session
+
+
+def _load_cookie_file(cookie_path: str) -> Dict[str, str]:
+    cookies = {}
+    if not os.path.exists(cookie_path):
+        return cookies
+    with open(cookie_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            cookies[key.strip()] = value.strip()
+    return cookies
+
+
+def _write_cookie_file(cookie_path: str, cookies: Dict[str, str]):
+    os.makedirs(os.path.dirname(os.path.abspath(cookie_path)), exist_ok=True)
+    tmp_path = cookie_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for key, value in cookies.items():
+            f.write(f"{key}={value}\n")
+    os.replace(tmp_path, cookie_path)
+
+
+def _is_auth_redirect(location: str) -> bool:
+    lowered = (location or "").lower()
+    return any(marker in lowered for marker in AUTH_REDIRECT_MARKERS)
+
+
+def _probe_cookie_valid(cookie_path: str, base_url: str) -> Dict[str, str]:
+    cookies = _load_cookie_file(cookie_path)
+    if not cookies:
+        return {}
+
+    session = _new_session()
+    session.cookies.update(cookies)
+    try:
+        response = session.get(
+            base_url, allow_redirects=False, timeout=REQUEST_TIMEOUT
+        )
+    except requests.RequestException:
+        return {}
+
+    location = response.headers.get("Location", "")
+    if response.is_redirect or response.is_permanent_redirect:
+        return {} if _is_auth_redirect(location) else cookies
+    if response.status_code >= 400:
+        return {}
+    return cookies
+
 
 def _get_initial_page(session: requests.Session) -> requests.Response:
     """获取 CAS 登录页面"""
     response = session.get(
-        "https://mis.bjtu.edu.cn/auth/sso/?next=/", allow_redirects=False
+        "https://mis.bjtu.edu.cn/auth/sso/?next=/",
+        allow_redirects=False,
+        timeout=REQUEST_TIMEOUT,
     )
     url = response.headers.get("Location")
-    response = session.get(url, allow_redirects=False)
+    response = session.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
     url = "https://cas.bjtu.edu.cn" + response.headers.get("Location")
-    return session.get(url, allow_redirects=False)
+    return session.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
 
 
 def _get_platform_cookie(session: requests.Session, base_url: str):
     """SSO 登录后访问课程平台，获取平台自己的 session cookie"""
-    session.get(base_url, allow_redirects=True)
+    session.get(base_url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
 
 
 def _extract_login_info(html: str) -> Dict[str, str]:
@@ -122,7 +184,8 @@ def _extract_login_info(html: str) -> Dict[str, str]:
 def _solve_captcha(session: requests.Session, captcha_id: str, ocr: CaptchaOCR) -> int:
     """下载验证码图片并求解"""
     captcha_img = session.get(
-        f"https://cas.bjtu.edu.cn/image/{captcha_id}"
+        f"https://cas.bjtu.edu.cn/image/{captcha_id}",
+        timeout=REQUEST_TIMEOUT,
     ).content
     return ocr.solve(captcha_img)
 
@@ -153,13 +216,15 @@ def _do_login(
             f"?next={parse.quote(login_info['next_url'])}"
         ),
     })
-    return session.post(url, data=payload, allow_redirects=False)
+    return session.post(
+        url, data=payload, allow_redirects=False, timeout=REQUEST_TIMEOUT
+    )
 
 
 def _follow_redirects(session: requests.Session, response: requests.Response):
     """登录后跟随 CAS → MIS 重定向链，完成 MIS 登录"""
     url = "https://cas.bjtu.edu.cn" + response.headers.get("Location")
-    response = session.get(url, allow_redirects=False)
+    response = session.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
 
     session.headers.update({"authority": "mis.bjtu.edu.cn"})
     url = response.headers.get("Location")
@@ -184,7 +249,7 @@ def _platform_oauth_login(session: requests.Session):
     # 1. 通过 MIS 模块入口访问课程平台
     resp = session.get(
         "https://mis.bjtu.edu.cn/module/module/28/",
-        allow_redirects=False, timeout=15,
+        allow_redirects=False, timeout=REQUEST_TIMEOUT,
     )
     loc = resp.headers.get("Location", "")
 
@@ -197,7 +262,7 @@ def _platform_oauth_login(session: requests.Session):
                 loc = "https://cas.bjtu.edu.cn" + loc
             else:
                 loc = "http://123.121.147.7:88" + loc
-        resp = session.get(loc, allow_redirects=False, timeout=15)
+        resp = session.get(loc, allow_redirects=False, timeout=REQUEST_TIMEOUT)
         loc = resp.headers.get("Location", "")
 
 
@@ -222,8 +287,7 @@ def login(username: str, password: str, model_path: str,
         cookies_dict: requests.Session cookies 字典
     """
     ocr = CaptchaOCR(model_path)
-    session = requests.Session()
-    session.headers.update(BASE_HEADERS)
+    session = _new_session()
 
     # 1. 获取 CAS 登录页面
     response = _get_initial_page(session)
@@ -275,6 +339,11 @@ def main():
         default="http://123.121.147.7:88/ve",
         help="课程平台地址（默认 http://123.121.147.7:88/ve）",
     )
+    parser.add_argument(
+        "--force-login",
+        action="store_true",
+        help="Force a fresh CAS login instead of reusing an existing cookie.",
+    )
     args = parser.parse_args()
 
     # 解析账号文件
@@ -311,6 +380,15 @@ def main():
     print(f"[信息] 目标: {args.base_url}")
 
     # 执行登录
+    root_cookie = os.path.join(script_dir, "..", "cookies.txt")
+    if not args.force_login:
+        cookies = _probe_cookie_valid(args.cookie, args.base_url)
+        if cookies:
+            _write_cookie_file(root_cookie, cookies)
+            print(f"[Info] Existing cookie is valid, skipped CAS login: {args.cookie}")
+            print(f"[Info] Cookie synced to project root: {root_cookie}")
+            return
+
     try:
         cookies = login(username, password, model_path, args.base_url)
     except Exception as e:
@@ -320,16 +398,11 @@ def main():
     print(f"[成功] Cookie 数量: {len(cookies)}")
 
     # 写入本地 cookie 文件
-    with open(args.cookie, "w", encoding="utf-8") as f:
-        for key, value in cookies.items():
-            f.write(f"{key}={value}\n")
+    _write_cookie_file(args.cookie, cookies)
     print(f"[信息] Cookie 已写入: {args.cookie}")
 
     # 同时替换根目录 cookies.txt
-    root_cookie = os.path.join(script_dir, "..", "cookies.txt")
-    with open(root_cookie, "w", encoding="utf-8") as f:
-        for key, value in cookies.items():
-            f.write(f"{key}={value}\n")
+    _write_cookie_file(root_cookie, cookies)
     print(f"[信息] 已同步到根目录: {root_cookie}")
 
 
