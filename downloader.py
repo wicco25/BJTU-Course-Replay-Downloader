@@ -40,7 +40,7 @@ class VideoDownloader:
 
     def _download_with_ffmpeg(self, m3u8_url, output_path, progress_callback=None):
         """使用ffmpeg下载HLS流"""
-        duration = self._get_hls_duration(m3u8_url)
+        duration = self._get_remote_download_duration(m3u8_url)
         if progress_callback:
             progress_callback(0)
         cmd = [
@@ -120,7 +120,7 @@ class VideoDownloader:
     def _download_audio_with_ffmpeg(self, m3u8_url, audio_path, progress_callback=None):
         """使用ffmpeg顺序读取HLS并拷贝音频流。"""
         os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-        duration = self._get_hls_duration(m3u8_url)
+        duration = self._get_remote_download_duration(m3u8_url)
         if progress_callback:
             progress_callback(0)
         cmd = [
@@ -327,6 +327,12 @@ class VideoDownloader:
         if duration > 0:
             return duration
         return self._get_media_duration(m3u8_url, headers=f"sessionId: {self.crawler.session_id}")
+
+    def _get_remote_download_duration(self, m3u8_url):
+        """Skip the extra remote playlist probe when fast progress is enabled."""
+        if self.cfg.get("fast_download_progress", True):
+            return None
+        return self._get_hls_duration(m3u8_url)
 
     def _get_media_duration(self, source, headers=None):
         """用ffprobe获取媒体时长；失败时返回None，进度仍会在完成时置满。"""

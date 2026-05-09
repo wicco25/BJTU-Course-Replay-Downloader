@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "whisper_model": "large-v3-turbo",
     "whisper_device": "auto",
     "whisper_language": "zh",
+    "fast_download_progress": True,
 }
 
 CONFIG_FILE = os.path.join(BASE_DIR, "settings.json")
