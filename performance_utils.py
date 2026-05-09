@@ -1,6 +1,7 @@
 """Small runtime helpers for keeping UI/network work lean."""
 
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -136,3 +137,19 @@ def is_complete_file(path, min_bytes=1024 * 1024):
 
 def is_audio_file(path):
     return str(path).lower().endswith((".mp3", ".wav", ".m4a", ".flac", ".aac"))
+
+
+DOWNLOAD_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}_\d{4}-\d{4}")
+
+
+def extract_download_time_key(filename):
+    match = DOWNLOAD_TIME_RE.search(str(filename))
+    return match.group(0) if match else ""
+
+
+def build_download_time_index(filenames):
+    return {
+        key
+        for key in (extract_download_time_key(filename) for filename in filenames)
+        if key
+    }

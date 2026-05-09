@@ -5,7 +5,9 @@ from pathlib import Path
 from performance_utils import (
     MemoryCache,
     ProgressThrottler,
+    build_download_time_index,
     bounded_worker_count,
+    extract_download_time_key,
     is_audio_file,
     is_complete_file,
     prefetch_stream_infos,
@@ -88,6 +90,22 @@ class FileCompletionTests(unittest.TestCase):
         self.assertTrue(is_audio_file("lesson.M4A"))
         self.assertTrue(is_audio_file("lecture.mp3"))
         self.assertFalse(is_audio_file("lecture.mp4"))
+
+    def test_download_time_index_extracts_course_time_keys(self):
+        filenames = [
+            "微积分_2026-04-29_1010-1200_课件画面.m4a",
+            "bad-name.m4a",
+            "英语_2026-04-30_0800-0950_课件画面.mp3",
+        ]
+
+        self.assertEqual(
+            extract_download_time_key(filenames[0]),
+            "2026-04-29_1010-1200",
+        )
+        self.assertEqual(
+            build_download_time_index(filenames),
+            {"2026-04-29_1010-1200", "2026-04-30_0800-0950"},
+        )
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ from config import load_config, save_config
 from performance_utils import (
     MemoryCache,
     ProgressThrottler,
+    build_download_time_index,
     bounded_worker_count,
     is_audio_file,
     is_complete_file,
@@ -824,6 +825,7 @@ class MainWindow(QMainWindow):
             for f in os.listdir(save_dir):
                 if f.startswith(safe_name):
                     existing_files.add(f)
+        downloaded_time_keys = build_download_time_index(existing_files)
 
         # 标记每条回放
         for i in range(self.replay_list.count()):
@@ -839,7 +841,7 @@ class MainWindow(QMainWindow):
                     break
 
             # 检查是否存在匹配的文件
-            downloaded = any(time_str in f for f in existing_files)
+            downloaded = time_str in downloaded_time_keys
             if downloaded:
                 item.setText(f"✓ {current_text}")
                 item.setForeground(Qt.darkGreen)
