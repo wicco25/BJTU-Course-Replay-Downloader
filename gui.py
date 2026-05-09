@@ -34,6 +34,7 @@ from downloader import VideoDownloader
 from transcriber import Transcriber
 from summarizer import Summarizer
 from config import load_config, save_config
+from performance_utils import MemoryCache
 
 # 用名字存已下载文件，跨 worker 共享
 _downloaded_files = []  # list of paths
@@ -208,6 +209,9 @@ class MainWindow(QMainWindow):
         self.current_course = None
         self.transcript_result = None
         self.worker = None
+        self.semester_cache = MemoryCache()
+        self.course_cache = MemoryCache()
+        self.calendar_cache = MemoryCache()
         self._init_ui()
         self._load_semesters()
 
@@ -516,10 +520,14 @@ class MainWindow(QMainWindow):
     # ========================= 数据加载 =========================
 
     def _load_semesters(self):
+        if self.semester_cache.has("all"):
+            self._on_semesters_loaded({"semesters": self.semester_cache.get("all")})
+            return
         self._log("加载学期列表...")
         self._run_worker("semesters", _on=self._on_semesters_loaded)
 
     def _on_semesters_loaded(self, data):
+        self.semester_cache.set("all", data.get("semesters", []))
         self.sem_combo.clear()
         for s in data.get("semesters", []):
             label = s.get("CNAME", s.get("xqCode", ""))
@@ -535,10 +543,19 @@ class MainWindow(QMainWindow):
         self._log(f"加载课程: {xq_code}")
         self.course_list.clear()
         self.replay_list.clear()
-        self._run_worker("courses", xq_code=xq_code, _on=self._on_courses_loaded)
+        if self.course_cache.has(xq_code):
+            self._on_courses_loaded({"courses": self.course_cache.get(xq_code)}, xq_code)
+            return
+        self._run_worker(
+            "courses",
+            xq_code=xq_code,
+            _on=lambda data, code=xq_code: self._on_courses_loaded(data, code),
+        )
 
-    def _on_courses_loaded(self, data):
+    def _on_courses_loaded(self, data, xq_code=None):
         self.courses = data.get("courses", [])
+        if xq_code:
+            self.course_cache.set(xq_code, self.courses)
         self.course_list.clear()
         for co in self.courses:
             text = f"{co['name']} | {co['course_num']} | {co.get('teacher_name','')}"
@@ -552,10 +569,22 @@ class MainWindow(QMainWindow):
         co = self.current_course
         self._log(f"选择课程: {co['name']} (cId={co['id']})")
         self.replay_list.clear()
-        self._run_worker("calendar", c_id=co["id"], _on=self._on_calendar_loaded)
+        course_id = co["id"]
+        if self.calendar_cache.has(course_id):
+            self._on_calendar_loaded(
+                {"calendar": self.calendar_cache.get(course_id)}, course_id
+            )
+            return
+        self._run_worker(
+            "calendar",
+            c_id=course_id,
+            _on=lambda data, cid=course_id: self._on_calendar_loaded(data, cid),
+        )
 
-    def _on_calendar_loaded(self, data):
+    def _on_calendar_loaded(self, data, course_id=None):
         self.calendar = data.get("calendar", [])
+        if course_id:
+            self.calendar_cache.set(course_id, self.calendar)
         self.replay_list.clear()
         for cal in self.calendar:
             time_str = cal.get("courseBetween", "")
