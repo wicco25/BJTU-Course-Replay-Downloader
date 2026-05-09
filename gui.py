@@ -34,7 +34,7 @@ from downloader import VideoDownloader
 from transcriber import Transcriber
 from summarizer import Summarizer
 from config import load_config, save_config
-from performance_utils import MemoryCache
+from performance_utils import MemoryCache, prefetch_stream_infos
 
 # 用名字存已下载文件，跨 worker 共享
 _downloaded_files = []  # list of paths
@@ -110,14 +110,21 @@ class CrawlerWorker(QThread):
         dl = VideoDownloader(crawler)
         total = len(items)
         audio_only_batch = any(item.get("audio_only") for item in items)
+        prefetch_workers = dl.cfg.get("stream_prefetch_workers", 4)
+        self.signals.log.emit(f"预取视频流信息: {total} 个任务")
+        stream_infos = prefetch_stream_infos(
+            CourseCrawler, items, user_id, max_workers=prefetch_workers
+        )
 
         for i, item in enumerate(items):
             self.signals.log.emit(
                 f"[{i+1}/{total}] 获取视频流: {os.path.basename(item['output_path'])}")
 
             self.signals.item_start.emit(i, "获取视频流")
-            stream_info = crawler.get_stream_info(
-                item["sched_id"], user_level=1, user_id=user_id)
+            stream_info = stream_infos.get(i)
+            if stream_info is None:
+                stream_info = crawler.get_stream_info(
+                    item["sched_id"], user_level=1, user_id=user_id)
             if not stream_info:
                 self.signals.item_fail.emit(i, "无法获取视频流信息")
                 continue
