@@ -1,0 +1,29 @@
+# 下载/输出目录
+downloads/
+audio/
+transcripts/
+subtitles/
+summaries/
+
+# 临时文件
+.tmp/
+__pycache__/
+*.pyc
+*.pyo
+
+# 敏感文件（Cookie、账号、本地配置）
+cookies.txt
+standalone-login/cookie.txt
+standalone-login/account.txt
+settings.json
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
