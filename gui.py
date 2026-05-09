@@ -3,6 +3,7 @@
 import os
 import sys
 import json
+import threading
 from datetime import datetime
 
 def _clear_dead_proxy_env():
@@ -34,7 +35,12 @@ from downloader import VideoDownloader
 from transcriber import Transcriber
 from summarizer import Summarizer
 from config import load_config, save_config
-from performance_utils import MemoryCache, prefetch_stream_infos
+from performance_utils import (
+    MemoryCache,
+    bounded_worker_count,
+    prefetch_stream_infos,
+    run_limited_concurrent,
+)
 
 # 用名字存已下载文件，跨 worker 共享
 _downloaded_files = []  # list of paths
@@ -115,6 +121,80 @@ class CrawlerWorker(QThread):
         stream_infos = prefetch_stream_infos(
             CourseCrawler, items, user_id, max_workers=prefetch_workers
         )
+
+        progress_lock = threading.Lock()
+        item_progress = [0.0] * total
+        download_workers = bounded_worker_count(
+            dl.cfg.get("download_workers", 2), total, default=2, upper=3
+        )
+        self.signals.log.emit(f"下载并发数: {download_workers}")
+
+        def update_progress(idx, pct):
+            with progress_lock:
+                item_progress[idx] = max(item_progress[idx], pct)
+                overall = int(sum(item_progress) / total * 100)
+            self.signals.progress.emit(
+                overall, f"[{idx+1}/{total}] 下载中 {int(pct * 100)}%"
+            )
+
+        def download_one(i, item):
+            local_crawler = CourseCrawler()
+            local_dl = VideoDownloader(local_crawler)
+            self.signals.log.emit(
+                f"[{i+1}/{total}] 获取视频流: {os.path.basename(item['output_path'])}")
+
+            self.signals.item_start.emit(i, "获取视频流")
+            stream_info = stream_infos.get(i)
+            if stream_info is None:
+                stream_info = local_crawler.get_stream_info(
+                    item["sched_id"], user_level=1, user_id=user_id)
+            if not stream_info:
+                self.signals.item_fail.emit(i, "无法获取视频流信息")
+                update_progress(i, 1.0)
+                return None
+
+            m3u8_url = stream_info.get(stream_key, "")
+            if not m3u8_url or m3u8_url == "noVideo":
+                self.signals.item_fail.emit(i, "该画面无视频")
+                update_progress(i, 1.0)
+                return None
+
+            self.signals.log.emit(f"[{i+1}/{total}] 开始下载...")
+            self.signals.item_start.emit(i, "下载中")
+
+            try:
+                if item.get("audio_only"):
+                    result = local_dl.download_audio_only(
+                        m3u8_url, item["output_path"],
+                        lambda pct, idx=i: update_progress(idx, pct),
+                    )
+                else:
+                    result = local_dl.download_m3u8(
+                        m3u8_url, item["output_path"],
+                        lambda pct, idx=i: update_progress(idx, pct),
+                    )
+
+                if result:
+                    _downloaded_files.append(result)
+                    self.signals.item_done.emit(i, result)
+                    update_progress(i, 1.0)
+                    return result
+                self.signals.item_fail.emit(i, "下载失败")
+                update_progress(i, 1.0)
+                return None
+            except Exception as e:
+                self.signals.item_fail.emit(i, str(e))
+                update_progress(i, 1.0)
+                return None
+
+        run_limited_concurrent(items, download_one, max_workers=download_workers, upper=3)
+
+        self.signals.progress.emit(100, "批量下载完成")
+        self.signals.finished.emit({
+            "batch": "download_complete",
+            "audio_only": audio_only_batch,
+        })
+        return
 
         for i, item in enumerate(items):
             self.signals.log.emit(

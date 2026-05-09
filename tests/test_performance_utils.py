@@ -1,6 +1,11 @@
 import unittest
 
-from performance_utils import MemoryCache, bounded_worker_count, prefetch_stream_infos
+from performance_utils import (
+    MemoryCache,
+    bounded_worker_count,
+    prefetch_stream_infos,
+    run_limited_concurrent,
+)
 
 
 class MemoryCacheTests(unittest.TestCase):
@@ -30,6 +35,17 @@ class StreamPrefetchTests(unittest.TestCase):
     def test_bounded_worker_count_caps_to_total_and_upper_bound(self):
         self.assertEqual(bounded_worker_count(99, total=3, upper=5), 3)
         self.assertEqual(bounded_worker_count("bad", total=10, default=4), 4)
+
+    def test_limited_concurrent_returns_results_in_input_order(self):
+        items = ["a", "b", "c"]
+
+        results = run_limited_concurrent(
+            items,
+            lambda idx, item: f"{idx}:{item}",
+            max_workers=2,
+        )
+
+        self.assertEqual(results, ["0:a", "1:b", "2:c"])
 
 
 if __name__ == "__main__":

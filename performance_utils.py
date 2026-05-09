@@ -66,3 +66,25 @@ def prefetch_stream_infos(crawler_factory, items, user_id, max_workers=4):
             except Exception:
                 results[idx] = None
     return results
+
+
+def run_limited_concurrent(items, worker, max_workers=2, upper=3):
+    """Run item work with bounded concurrency and return results by item order."""
+    total = len(items)
+    if total == 0:
+        return []
+
+    workers = bounded_worker_count(max_workers, total, default=2, upper=upper)
+    if workers <= 1:
+        return [worker(idx, item) for idx, item in enumerate(items)]
+
+    results = [None] * total
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(worker, idx, item): idx
+            for idx, item in enumerate(items)
+        }
+        for future in as_completed(future_map):
+            idx = future_map[future]
+            results[idx] = future.result()
+    return results
