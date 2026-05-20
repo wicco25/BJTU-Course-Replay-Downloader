@@ -153,3 +153,31 @@ def build_download_time_index(filenames):
         for key in (extract_download_time_key(filename) for filename in filenames)
         if key
     }
+
+
+def extract_download_stream_key(filename, stream_labels):
+    """Return the stream key encoded in a generated download filename."""
+    text = str(filename)
+    for stream_key, label in stream_labels.items():
+        if f"_{label}_" in text:
+            return stream_key
+    return ""
+
+
+def extract_download_identity(filename, stream_labels):
+    time_key = extract_download_time_key(filename)
+    stream_key = extract_download_stream_key(filename, stream_labels)
+    if not time_key or not stream_key:
+        return None
+    return time_key, stream_key
+
+
+def build_download_stream_index(filenames, stream_labels):
+    return {
+        identity
+        for identity in (
+            extract_download_identity(filename, stream_labels)
+            for filename in filenames
+        )
+        if identity
+    }

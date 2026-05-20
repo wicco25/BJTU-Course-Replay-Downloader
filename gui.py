@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import threading
+import webbrowser
 from datetime import datetime
 
 def _clear_dead_proxy_env():
@@ -27,8 +28,8 @@ from PyQt5.QtWidgets import (
     QFormLayout, QAbstractItemView, QTreeWidget, QTreeWidgetItem,
     QHeaderView
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QSignalBlocker, pyqtSignal, QObject, QThread
+from PyQt5.QtGui import QBrush, QColor, QFont
 
 from crawler import CourseCrawler
 from downloader import VideoDownloader
@@ -38,7 +39,7 @@ from config import load_config, save_config
 from performance_utils import (
     MemoryCache,
     ProgressThrottler,
-    build_download_time_index,
+    build_download_stream_index,
     bounded_worker_count,
     is_audio_file,
     is_complete_file,
@@ -48,6 +49,17 @@ from performance_utils import (
 
 # 用名字存已下载文件，跨 worker 共享
 _downloaded_files = []  # list of paths
+
+STREAM_OPTIONS = [
+    {"key": "course_url", "label": "课件画面", "file_label": "课件画面"},
+    {"key": "teacher_url", "label": "教师画面", "file_label": "教师画面"},
+    {"key": "student_url", "label": "学生画面", "file_label": "学生画面"},
+]
+STREAM_OPTION_BY_KEY = {option["key"]: option for option in STREAM_OPTIONS}
+BRUSH_DONE = QBrush(QColor(Qt.darkGreen))
+BRUSH_PARTIAL = QBrush(QColor(Qt.darkYellow))
+BRUSH_ERROR = QBrush(QColor(Qt.red))
+BRUSH_NORMAL = QBrush(QColor(Qt.black))
 
 
 class WorkerSignals(QObject):
@@ -85,6 +97,18 @@ class CrawlerWorker(QThread):
                 c = CourseCrawler()
                 self.signals.finished.emit({
                     "calendar": c.get_teaching_calendar(self.kwargs["c_id"])
+                })
+
+            elif self.task == "stream_info":
+                c = CourseCrawler()
+                sched_id = self.kwargs["sched_id"]
+                user_id = self.kwargs.get("user_id", "170179")
+                self.signals.finished.emit({
+                    "sched_id": sched_id,
+                    "stream_info": c.get_stream_info(
+                        sched_id, user_level=1, user_id=user_id
+                    ),
+                    "request_id": self.kwargs.get("request_id"),
                 })
 
             elif self.task == "batch_download":
@@ -308,10 +332,18 @@ class MainWindow(QMainWindow):
         self.current_course = None
         self.transcript_result = None
         self.worker = None
+        self.workers = []
         self.semester_cache = MemoryCache()
         self.course_cache = MemoryCache()
         self.calendar_cache = MemoryCache()
         self._active_task_rows = []
+        self._download_batches = {}
+        self._download_batch_streams = {}
+        self._active_download_streams = set()
+        self._next_batch_id = 1
+        self._stream_info_request_id = 0
+        self._current_stream_info = None
+        self._loading_calendar = False
         self._init_ui()
         self._load_semesters()
 
@@ -368,6 +400,9 @@ class MainWindow(QMainWindow):
         self.replay_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.replay_list.setMinimumHeight(200)
         self.replay_list.itemSelectionChanged.connect(self._on_replay_selection_changed)
+        self.replay_list.currentItemChanged.connect(
+            lambda *_: self._load_current_replay_streams()
+        )
         rl.addWidget(self.replay_list)
         left_layout.addWidget(rg)
 
@@ -387,13 +422,10 @@ class MainWindow(QMainWindow):
         sg = QGroupBox("视频画面")
         slayout = QGridLayout(sg)
         self.stream_combo = QComboBox()
-        self.stream_combo.addItems([
-            "课件画面 (course_url)",
-            "教师画面 (teacher_url)",
-            "学生画面 (student_url)",
-            "教师特写 (teacher_closeup_url)",
-            "学生特写 (student_closeup_url)",
-        ])
+        for option in STREAM_OPTIONS:
+            self.stream_combo.addItem(
+                f"{option['label']} ({option['key']})", option["key"]
+            )
         slayout.addWidget(QLabel("选择画面:"), 0, 0)
         slayout.addWidget(self.stream_combo, 0, 1)
         self.video_format_cb = QCheckBox("视频 MP4")
@@ -411,6 +443,17 @@ class MainWindow(QMainWindow):
         format_tip.setWordWrap(True)
         slayout.addWidget(format_tip, 2, 0, 1, 2)
         dl_layout.addWidget(sg)
+
+        # 当前回放 URL
+        ug = QGroupBox("当前回放 URL")
+        ul = QVBoxLayout(ug)
+        self.stream_url_tree = QTreeWidget()
+        self.stream_url_tree.setHeaderLabels(["画面", "状态", "URL", "操作"])
+        self.stream_url_tree.setRootIsDecorated(False)
+        self.stream_url_tree.setMaximumHeight(130)
+        self.stream_url_tree.header().setSectionResizeMode(2, QHeaderView.Stretch)
+        ul.addWidget(self.stream_url_tree)
+        dl_layout.addWidget(ug)
 
         # 路径
         pg = QGroupBox("保存设置")
@@ -702,7 +745,13 @@ class MainWindow(QMainWindow):
         self.current_course = item.data(Qt.UserRole)
         co = self.current_course
         self._log(f"选择课程: {co['name']} (cId={co['id']})")
-        self.replay_list.clear()
+        self._loading_calendar = True
+        self._stream_info_request_id += 1
+        self._current_stream_info = None
+        self._render_stream_url_table(None)
+        with QSignalBlocker(self.replay_list):
+            self.replay_list.clear()
+        self._on_replay_selection_changed()
         course_id = co["id"]
         if self.calendar_cache.has(course_id):
             self._on_calendar_loaded(
@@ -713,37 +762,211 @@ class MainWindow(QMainWindow):
             "calendar",
             c_id=course_id,
             _on=lambda data, cid=course_id: self._on_calendar_loaded(data, cid),
+            _error=self._on_calendar_error,
         )
 
     def _on_calendar_loaded(self, data, course_id=None):
+        if self.current_course and course_id and course_id != self.current_course.get("id"):
+            return
         self.calendar = data.get("calendar", [])
         if course_id:
             self.calendar_cache.set(course_id, self.calendar)
-        self.replay_list.clear()
-        for cal in self.calendar:
-            time_str = cal.get("courseBetween", "")
-            name = cal.get("courseScheName") or cal.get("content", "")
-            if name and len(name) > 60:
-                name = name[:60] + "..."
-            item = QListWidgetItem(f"{time_str} | {name}")
-            item.setData(Qt.UserRole, cal)
-            self.replay_list.addItem(item)
+        with QSignalBlocker(self.replay_list):
+            self.replay_list.clear()
+            for cal in self.calendar:
+                time_str = cal.get("courseBetween", "")
+                name = cal.get("courseScheName") or cal.get("content", "")
+                if name and len(name) > 60:
+                    name = name[:60] + "..."
+                item = QListWidgetItem(f"{time_str} | {name}")
+                item.setData(Qt.UserRole, cal)
+                self.replay_list.addItem(item)
+        self._loading_calendar = False
+        self._on_replay_selection_changed()
         self._log(f"加载到 {len(self.calendar)} 次回放")
         self._mark_downloaded()
 
+    def _on_calendar_error(self, msg):
+        self._loading_calendar = False
+        self._on_error(msg)
+
     def _on_replay_selection_changed(self):
-        count = len(self.replay_list.selectedItems())
+        if self._loading_calendar:
+            return
+        selected = self.replay_list.selectedItems()
+        count = len(selected)
         self.replay_count_label.setText(f"已选: {count}")
         enable = count > 0 and self.current_course is not None
         self.dl_btn.setEnabled(enable)
         self.dl_audio_btn.setEnabled(enable)
+        if selected and self.replay_list.currentItem() is None:
+            self.replay_list.setCurrentItem(selected[0])
+        elif not selected:
+            self._current_stream_info = None
+            self._render_stream_url_table(None)
+
+    def _stream_file_label(self, stream_key):
+        return STREAM_OPTION_BY_KEY.get(stream_key, STREAM_OPTIONS[0])["file_label"]
+
+    def _stream_label(self, stream_key):
+        return STREAM_OPTION_BY_KEY.get(stream_key, STREAM_OPTIONS[0])["label"]
+
+    def _stream_label_map(self):
+        return {
+            option["key"]: option["file_label"]
+            for option in STREAM_OPTIONS
+        }
+
+    def _normalize_stream_url(self, url):
+        return str(url or "").strip()
+
+    def _is_stream_available(self, url):
+        url = self._normalize_stream_url(url)
+        return bool(url) and url != "noVideo"
+
+    def _current_replay_item(self):
+        return self.replay_list.currentItem() or (
+            self.replay_list.selectedItems()[0]
+            if self.replay_list.selectedItems() else None
+        )
+
+    def _load_current_replay_streams(self):
+        if self._loading_calendar:
+            return
+        item = self._current_replay_item()
+        if not item:
+            self._current_stream_info = None
+            self._render_stream_url_table(None)
+            return
+
+        sched = item.data(Qt.UserRole)
+        if not sched:
+            self._current_stream_info = None
+            self._render_stream_url_table(None)
+            return
+
+        self._stream_info_request_id += 1
+        request_id = self._stream_info_request_id
+        self._current_stream_info = None
+        self._render_stream_url_table(None, loading=True)
+        self._run_worker(
+            "stream_info",
+            sched_id=sched["id"],
+            user_id="170179",
+            request_id=request_id,
+            _on=self._on_stream_info_loaded,
+            _error=lambda msg: self._on_stream_info_error(msg, request_id),
+        )
+
+    def _on_stream_info_loaded(self, data):
+        if data.get("request_id") != self._stream_info_request_id:
+            return
+        self._current_stream_info = data.get("stream_info") or {}
+        self._render_stream_url_table(self._current_stream_info)
+
+    def _on_stream_info_error(self, msg, request_id):
+        if request_id != self._stream_info_request_id:
+            return
+        self._log(f"加载回放 URL 失败: {msg}")
+        self._current_stream_info = None
+        self._render_stream_url_table(None)
+
+    def _render_stream_url_table(self, stream_info, loading=False):
+        self.stream_url_tree.clear()
+        sched_item = self._current_replay_item()
+        sched = sched_item.data(Qt.UserRole) if sched_item else None
+        for option in STREAM_OPTIONS:
+            stream_key = option["key"]
+            url = self._normalize_stream_url(
+                (stream_info or {}).get(stream_key, "") if stream_info else ""
+            )
+            available = self._is_stream_available(url)
+            if loading:
+                status = "加载中"
+                url_text = ""
+            elif not available:
+                status = "无"
+                url_text = "无"
+            else:
+                status = self._stream_download_status(sched, stream_key)
+                url_text = url
+
+            row = QTreeWidgetItem([option["label"], status, url_text, ""])
+            row.setData(0, Qt.UserRole, stream_key)
+            if available:
+                row.setToolTip(2, url)
+            if status == "已下载":
+                row.setForeground(1, BRUSH_DONE)
+            elif status == "部分已下载":
+                row.setForeground(1, BRUSH_PARTIAL)
+            elif status in ("无", "失败"):
+                row.setForeground(1, BRUSH_ERROR)
+            self.stream_url_tree.addTopLevelItem(row)
+
+            action_widget = QWidget()
+            action_layout = QHBoxLayout(action_widget)
+            action_layout.setContentsMargins(0, 0, 0, 0)
+            open_btn = QPushButton("打开")
+            open_btn.setEnabled(available)
+            open_btn.clicked.connect(lambda _, u=url: self._open_stream_url(u))
+            download_btn = QPushButton("下载")
+            download_btn.setEnabled(available and bool(sched))
+            download_btn.clicked.connect(
+                lambda _, key=stream_key: self._start_single_stream_download(key)
+            )
+            action_layout.addWidget(open_btn)
+            action_layout.addWidget(download_btn)
+            self.stream_url_tree.setItemWidget(row, 3, action_widget)
+
+    def _stream_download_status(self, sched, stream_key):
+        if not sched or not self.current_course:
+            return "未下载"
+        if (sched.get("id"), stream_key) in self._active_download_streams:
+            return "下载中"
+        formats = self._selected_download_formats(save=False) or [{
+            "kind": "video",
+            "label": "视频",
+            "ext": "mp4",
+            "audio_only": False,
+        }]
+        existing = 0
+        for fmt in formats:
+            path = self._download_output_path(sched, stream_key, fmt)
+            if is_complete_file(path):
+                existing += 1
+        if existing == len(formats):
+            return "已下载"
+        if existing:
+            return "部分已下载"
+        return "未下载"
+
+    def _open_stream_url(self, url):
+        if self._is_stream_available(url):
+            webbrowser.open(url)
+
+    def _start_single_stream_download(self, stream_key):
+        item = self._current_replay_item()
+        if not item:
+            QMessageBox.warning(self, "提示", "请先选择一次回放")
+            return
+        self._start_batch_download(
+            stream_key_override=stream_key,
+            selected_items=[item],
+        )
+
+    def _download_output_path(self, sched, stream_key, fmt):
+        co = self.current_course
+        safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in co["name"])
+        time_str = sched.get("courseBetween", "").replace(":", "").replace(" ", "_")
+        stream_label = self._stream_file_label(stream_key)
+        filename = f"{safe_name}_{time_str}_{stream_label}_{fmt['label']}.{fmt['ext']}"
+        save_dir = self.path_edit.text() or self.cfg["download_dir"]
+        return os.path.join(save_dir, filename)
 
     # ========================= 批量下载 =========================
 
     def _get_stream_key(self):
-        keys = ["course_url", "teacher_url", "student_url",
-                "teacher_closeup_url", "student_closeup_url"]
-        return keys[self.stream_combo.currentIndex()]
+        return self.stream_combo.currentData() or STREAM_OPTIONS[0]["key"]
 
     def _update_download_button_text(self, *_):
         formats = self._selected_download_formats(save=False)
@@ -785,8 +1008,9 @@ class MainWindow(QMainWindow):
     def _start_download_from_options(self):
         self._start_batch_download()
 
-    def _start_batch_download(self, audio_only=None):
-        selected = self.replay_list.selectedItems()
+    def _start_batch_download(self, audio_only=None, stream_key_override=None,
+                              selected_items=None):
+        selected = selected_items or self.replay_list.selectedItems()
         if not selected or not self.current_course:
             QMessageBox.warning(self, "提示", "请先选择课程和至少一次回放")
             return
@@ -803,10 +1027,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请至少勾选一种下载格式：视频 MP4 或音频 M4A")
             return
 
-        co = self.current_course
-        stream_key = self._get_stream_key()
-        stream_label = self.stream_combo.currentText().split(" (")[0]
-        safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in co["name"])
+        stream_key = stream_key_override or self._get_stream_key()
+        stream_label = self._stream_label(stream_key)
         save_dir = self.path_edit.text() or self.cfg["download_dir"]
         os.makedirs(save_dir, exist_ok=True)
         self.cfg["download_dir"] = save_dir
@@ -814,34 +1036,39 @@ class MainWindow(QMainWindow):
         save_config(self.cfg)
 
         items = []
-        self._active_task_rows = []
-        self.task_tree.clear()
+        batch_id = self._next_batch_id
+        self._next_batch_id += 1
+        active_task_rows = []
+        active_streams = set()
+        self._download_batches[batch_id] = active_task_rows
         for item in selected:
             sched = item.data(Qt.UserRole)
-            time_str = sched.get("courseBetween", "").replace(":", "").replace(" ", "_")
             for fmt in formats:
-                filename = f"{safe_name}_{time_str}_{stream_label}_{fmt['label']}.{fmt['ext']}"
-                output_path = os.path.join(save_dir, filename)
+                output_path = self._download_output_path(sched, stream_key, fmt)
+                filename = os.path.basename(output_path)
 
                 twi = QTreeWidgetItem([
                     "等待",
                     filename,
-                    f"{sched.get('courseBetween', '')} | {fmt['label']}",
+                    f"{sched.get('courseBetween', '')} | {stream_label} | {fmt['label']}",
                 ])
                 twi.setData(0, Qt.UserRole, output_path)
+                twi.setData(1, Qt.UserRole, batch_id)
+                twi.setData(2, Qt.UserRole, stream_key)
                 self.task_tree.addTopLevelItem(twi)
                 task_row = self.task_tree.topLevelItemCount() - 1
 
                 if is_complete_file(output_path):
                     twi.setText(0, "已存在")
-                    twi.setTextColor(0, Qt.darkGreen)
+                    twi.setForeground(0, BRUSH_DONE)
                     _downloaded_files.append(output_path)
                     continue
 
-                self._active_task_rows.append(task_row)
+                active_task_rows.append(task_row)
+                active_streams.add((sched["id"], stream_key))
                 items.append({
                     "sched_id": sched["id"],
-                    "label": time_str,
+                    "label": sched.get("courseBetween", ""),
                     "output_path": output_path,
                     "audio_only": fmt["audio_only"],
                     "format_kind": fmt["kind"],
@@ -849,62 +1076,87 @@ class MainWindow(QMainWindow):
 
         if not items:
             self._log("选中文件均已存在，跳过下载")
+            self._download_batches.pop(batch_id, None)
             self.progress_bar.setValue(100)
             self._refresh_audio_list()
+            self._render_stream_url_table(self._current_stream_info)
             return
 
+        self._download_batch_streams[batch_id] = active_streams
+        self._active_download_streams.update(active_streams)
+        self._render_stream_url_table(self._current_stream_info)
+
         format_names = "+".join(fmt["label"] for fmt in formats)
-        self._log(f"开始批量{format_names}下载: {len(items)} 个任务")
-        self.dl_btn.setEnabled(False)
-        self.dl_audio_btn.setEnabled(False)
+        self._log(f"开始批量{format_names}下载: {len(items)} 个任务 ({stream_label})")
+        self._on_replay_selection_changed()
         self.progress_bar.setValue(0)
 
         self._run_worker("batch_download",
-                         items=items, stream_key=stream_key, user_id="170179",
-                         _on=self._on_batch_dl_done,
-                         _progress=self._on_progress,
-                         _item_start=self._on_item_start,
-                         _item_done=self._on_item_done,
-                         _item_fail=self._on_item_fail)
+                          items=items, stream_key=stream_key, user_id="170179",
+                          _on=lambda data, bid=batch_id: self._on_batch_dl_done(bid, data),
+                          _progress=self._on_progress,
+                          _item_start=lambda idx, msg, bid=batch_id: self._on_item_start(bid, idx, msg),
+                          _item_done=lambda idx, path, bid=batch_id: self._on_item_done(bid, idx, path),
+                          _item_fail=lambda idx, reason, bid=batch_id: self._on_item_fail(bid, idx, reason),
+                          _error=lambda msg, bid=batch_id: self._on_batch_dl_error(bid, msg))
 
-    def _on_item_start(self, idx, message):
-        row = self._task_row_for_worker_index(idx)
+    def _on_item_start(self, batch_id, idx, message):
+        row = self._task_row_for_worker_index(batch_id, idx)
         if row < self.task_tree.topLevelItemCount():
             twi = self.task_tree.topLevelItem(row)
             twi.setText(0, message)
 
-    def _on_item_done(self, idx, path):
-        row = self._task_row_for_worker_index(idx)
+    def _on_item_done(self, batch_id, idx, path):
+        row = self._task_row_for_worker_index(batch_id, idx)
         if row < self.task_tree.topLevelItemCount():
             twi = self.task_tree.topLevelItem(row)
             twi.setText(0, "完成")
-            twi.setForeground(0, QFont("", -1, -1, QFont.Bold).weight if False else Qt.darkGreen)
-            twi.setTextColor(0, Qt.darkGreen)
+            twi.setForeground(0, BRUSH_DONE)
+        self._render_stream_url_table(self._current_stream_info)
         self._log(f"  [{idx+1}] 完成: {os.path.basename(path)}")
 
-    def _on_item_fail(self, idx, reason):
-        row = self._task_row_for_worker_index(idx)
+    def _on_item_fail(self, batch_id, idx, reason):
+        row = self._task_row_for_worker_index(batch_id, idx)
         if row < self.task_tree.topLevelItemCount():
             twi = self.task_tree.topLevelItem(row)
             twi.setText(0, "失败")
-            twi.setTextColor(0, Qt.red)
+            twi.setForeground(0, BRUSH_ERROR)
             twi.setText(2, reason)
+        self._render_stream_url_table(self._current_stream_info)
         self._log(f"  [{idx+1}] 失败: {reason}")
 
-    def _task_row_for_worker_index(self, idx):
-        if 0 <= idx < len(self._active_task_rows):
-            return self._active_task_rows[idx]
+    def _task_row_for_worker_index(self, batch_id, idx):
+        rows = self._download_batches.get(batch_id, self._active_task_rows)
+        if 0 <= idx < len(rows):
+            return rows[idx]
         return idx
 
-    def _on_batch_dl_done(self, data):
+    def _on_batch_dl_done(self, batch_id, data):
         self._log("批量下载结束")
-        self.dl_btn.setEnabled(True)
-        self.dl_audio_btn.setEnabled(True)
+        self._download_batches.pop(batch_id, None)
+        self._clear_batch_streams(batch_id)
+        self._on_replay_selection_changed()
         self._mark_downloaded()
+        self._render_stream_url_table(self._current_stream_info)
         self._append_audio_files(data.get("downloaded_files", []))
         if data.get("audio_only") and self.tr_file_list.count() > 0:
             self._log("音频已加入转写列表")
             self.tabs.setCurrentIndex(1)
+
+    def _on_batch_dl_error(self, batch_id, msg):
+        self._download_batches.pop(batch_id, None)
+        self._clear_batch_streams(batch_id)
+        self._render_stream_url_table(self._current_stream_info)
+        self._on_error(msg)
+
+    def _clear_batch_streams(self, batch_id):
+        completed = self._download_batch_streams.pop(batch_id, set())
+        remaining = set()
+        for stream_set in self._download_batch_streams.values():
+            remaining.update(stream_set)
+        for stream_identity in completed:
+            if stream_identity not in remaining:
+                self._active_download_streams.discard(stream_identity)
 
     def _mark_downloaded(self):
         """扫描下载目录，在回放列表中标记已下载的项"""
@@ -920,7 +1172,9 @@ class MainWindow(QMainWindow):
             for f in os.listdir(save_dir):
                 if f.startswith(safe_name):
                     existing_files.add(f)
-        downloaded_time_keys = build_download_time_index(existing_files)
+        downloaded_streams = build_download_stream_index(
+            existing_files, self._stream_label_map()
+        )
 
         # 标记每条回放
         for i in range(self.replay_list.count()):
@@ -930,19 +1184,24 @@ class MainWindow(QMainWindow):
             current_text = item.text()
 
             # 去掉旧的标记前缀
-            for prefix in ("✓ ", "○ "):
+            for prefix in ("✓ ", "◐ ", "○ "):
                 if current_text.startswith(prefix):
                     current_text = current_text[2:]
                     break
 
-            # 检查是否存在匹配的文件
-            downloaded = time_str in downloaded_time_keys
-            if downloaded:
+            stream_count = sum(
+                1 for option in STREAM_OPTIONS
+                if (time_str, option["key"]) in downloaded_streams
+            )
+            if stream_count == len(STREAM_OPTIONS):
                 item.setText(f"✓ {current_text}")
-                item.setForeground(Qt.darkGreen)
+                item.setForeground(BRUSH_DONE)
+            elif stream_count:
+                item.setText(f"◐ {current_text}")
+                item.setForeground(BRUSH_PARTIAL)
             else:
                 item.setText(f"○ {current_text}")
-                item.setForeground(Qt.black)
+                item.setForeground(BRUSH_NORMAL)
 
     # ========================= 转写 =========================
 
@@ -1168,20 +1427,27 @@ class MainWindow(QMainWindow):
     def _run_worker(self, task, _on=None, _progress=None, _error=None,
                     _item_start=None, _item_done=None, _item_fail=None,
                     **kwargs):
-        self.worker = CrawlerWorker(task, **kwargs)
+        worker = CrawlerWorker(task, **kwargs)
+        self.worker = worker
+        self.workers.append(worker)
         if _on:
-            self.worker.signals.finished.connect(_on)
+            worker.signals.finished.connect(_on)
         if _progress:
-            self.worker.signals.progress.connect(_progress)
+            worker.signals.progress.connect(_progress)
         if _item_start:
-            self.worker.signals.item_start.connect(_item_start)
+            worker.signals.item_start.connect(_item_start)
         if _item_done:
-            self.worker.signals.item_done.connect(_item_done)
+            worker.signals.item_done.connect(_item_done)
         if _item_fail:
-            self.worker.signals.item_fail.connect(_item_fail)
-        self.worker.signals.error.connect(_error or self._on_error)
-        self.worker.signals.log.connect(self._log)
-        self.worker.start()
+            worker.signals.item_fail.connect(_item_fail)
+        worker.signals.error.connect(_error or self._on_error)
+        worker.signals.log.connect(self._log)
+        worker.finished.connect(lambda w=worker: self._workers_remove(w))
+        worker.start()
+
+    def _workers_remove(self, worker):
+        if worker in self.workers:
+            self.workers.remove(worker)
 
     def _on_progress(self, value, msg):
         self.progress_bar.setValue(min(value, 100))

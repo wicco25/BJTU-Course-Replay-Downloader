@@ -373,9 +373,6 @@ class CourseCrawler:
             "course_url": "课件画面",
             "teacher_url": "教师画面",
             "student_url": "学生画面",
-            "teacher_closeup_url": "教师特写",
-            "student_closeup_url": "学生特写",
-            "movie_url": "电影画面",
         }
         for key, label in mapping.items():
             url = stream_info.get(key, "")

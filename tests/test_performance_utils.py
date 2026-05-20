@@ -5,8 +5,11 @@ from pathlib import Path
 from performance_utils import (
     MemoryCache,
     ProgressThrottler,
+    build_download_stream_index,
     build_download_time_index,
     bounded_worker_count,
+    extract_download_identity,
+    extract_download_stream_key,
     extract_download_time_key,
     is_audio_file,
     is_complete_file,
@@ -105,6 +108,36 @@ class FileCompletionTests(unittest.TestCase):
         self.assertEqual(
             build_download_time_index(filenames),
             {"2026-04-29_1010-1200", "2026-04-30_0800-0950"},
+        )
+
+    def test_download_stream_index_distinguishes_urls_for_same_replay(self):
+        stream_labels = {
+            "course_url": "课件画面",
+            "teacher_url": "教师画面",
+            "student_url": "学生画面",
+        }
+        filenames = [
+            "数学_2026-04-29_1010-1200_课件画面_视频.mp4",
+            "数学_2026-04-29_1010-1200_教师画面_视频.mp4",
+            "数学_2026-04-29_1010-1200_学生画面_音频.m4a",
+            "数学_2026-04-29_1010-1200_教师特写_视频.mp4",
+        ]
+
+        self.assertEqual(
+            extract_download_stream_key(filenames[0], stream_labels),
+            "course_url",
+        )
+        self.assertEqual(
+            extract_download_identity(filenames[1], stream_labels),
+            ("2026-04-29_1010-1200", "teacher_url"),
+        )
+        self.assertEqual(
+            build_download_stream_index(filenames, stream_labels),
+            {
+                ("2026-04-29_1010-1200", "course_url"),
+                ("2026-04-29_1010-1200", "teacher_url"),
+                ("2026-04-29_1010-1200", "student_url"),
+            },
         )
 
 
