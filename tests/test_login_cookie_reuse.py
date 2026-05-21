@@ -43,6 +43,96 @@ class FakeSession:
 
 
 class CookieReuseTests(unittest.TestCase):
+    def test_extract_session_id_from_absolute_url(self):
+        url = "http://example/ve/back/coursePlatform/coursePlatform.shtml?method=x&sessionId=6264B6"
+
+        self.assertEqual(login_mod._extract_session_id_from_url(url), "6264B6")
+
+    def test_extract_session_id_from_relative_url(self):
+        url = "/ve/back/coursePlatform/coursePlatform.shtml?method=x&sessionId=6264B6"
+
+        self.assertEqual(login_mod._extract_session_id_from_url(url), "6264B6")
+
+    def test_extract_session_id_returns_empty_for_missing_value(self):
+        url = "/ve/back/coursePlatform/coursePlatform.shtml?method=x"
+
+        self.assertEqual(login_mod._extract_session_id_from_url(url), "")
+
+    def test_extract_session_id_from_html_text(self):
+        html = '<a href="/ve/back/coursePlatform/coursePlatform.shtml?sessionId=htmlsid&method=x">x</a>'
+
+        self.assertEqual(login_mod._extract_session_id_from_text(html), "htmlsid")
+        self.assertEqual(login_mod._extract_session_ids_from_text(html), ["htmlsid"])
+
+    def test_extract_session_id_prefers_ajax_header_from_html_text(self):
+        html = """
+        XMLHttpRequest.setRequestHeader("sessionId", 'apisid');
+        <a href="/ve/back/coursePlatform/coursePlatform.shtml?sessionId=menusid&method=x">x</a>
+        """
+
+        self.assertEqual(
+            login_mod._extract_session_ids_from_text(html),
+            ["apisid", "menusid"],
+        )
+
+    def test_platform_oauth_login_returns_session_id_from_redirect(self):
+        fake_session = FakeSession([
+            FakeResponse(
+                status_code=302,
+                location="/ve/back/coursePlatform/coursePlatform.shtml?method=toCoursePlatformIndex&sessionId=dynamic",
+            ),
+            FakeResponse(status_code=200),
+        ])
+
+        with patch.object(
+            login_mod, "_select_valid_session_id",
+            side_effect=lambda _session, _base_url, candidates: candidates[0],
+        ):
+            session_id = login_mod._platform_oauth_login(fake_session, "http://example/ve")
+
+        self.assertEqual(session_id, "dynamic")
+        self.assertEqual(
+            fake_session.calls[1][0],
+            "http://example/ve/back/coursePlatform/coursePlatform.shtml?method=toCoursePlatformIndex&sessionId=dynamic",
+        )
+
+    def test_platform_oauth_login_falls_back_to_index_html(self):
+        fake_session = FakeSession([
+            FakeResponse(status_code=302, location="http://example/oauth/api/user/thirdLogin"),
+            FakeResponse(status_code=200),
+            FakeResponse(
+                status_code=200,
+                text='<a href="/ve/back/coursePlatform/coursePlatform.shtml?sessionId=htmlsid&method=x">x</a>',
+            ),
+        ])
+
+        selections = ["", "htmlsid"]
+        with patch.object(
+            login_mod, "_select_valid_session_id",
+            side_effect=lambda _session, _base_url, candidates: selections.pop(0),
+        ):
+            session_id = login_mod._platform_oauth_login(fake_session, "http://example/ve")
+
+        self.assertEqual(session_id, "htmlsid")
+        self.assertEqual(
+            fake_session.calls[-1][1]["params"],
+            {"method": "toCoursePlatformIndex"},
+        )
+
+    def test_write_project_session_id_merges_existing_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = Path(tmp) / "standalone-login"
+            script_dir.mkdir()
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text('{"base_url": "http://example", "session_id": "old"}', encoding="utf-8")
+
+            login_mod._write_project_session_id(str(script_dir), "new")
+
+            settings = login_mod.json.loads(settings_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(settings["base_url"], "http://example")
+        self.assertEqual(settings["session_id"], "new")
+
     def test_probe_reuses_valid_cookie_without_redirect(self):
         with tempfile.TemporaryDirectory() as tmp:
             cookie_path = Path(tmp) / "cookie.txt"
@@ -59,7 +149,9 @@ class CookieReuseTests(unittest.TestCase):
             ])
 
             with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                cookies = login_mod._probe_cookie_valid(str(cookie_path), "http://example/ve")
+                cookies = login_mod._probe_cookie_valid(
+                    str(cookie_path), "http://example/ve", session_id="sid"
+                )
 
         self.assertEqual(cookies, {"JSESSIONID": "abc"})
         self.assertFalse(fake_session.trust_env)
@@ -70,7 +162,7 @@ class CookieReuseTests(unittest.TestCase):
         )
         self.assertEqual(
             fake_session.calls[0][1]["headers"]["sessionId"],
-            login_mod.DEFAULT_SESSION_ID,
+            "sid",
         )
 
     def test_probe_rejects_auth_redirect(self):
@@ -89,7 +181,9 @@ class CookieReuseTests(unittest.TestCase):
             ])
 
             with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                cookies = login_mod._probe_cookie_valid(str(cookie_path), "http://example/ve")
+                cookies = login_mod._probe_cookie_valid(
+                    str(cookie_path), "http://example/ve", session_id="sid"
+                )
 
         self.assertEqual(cookies, {})
 
@@ -109,7 +203,9 @@ class CookieReuseTests(unittest.TestCase):
             ])
 
             with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                cookies = login_mod._probe_cookie_valid(str(cookie_path), "http://example/ve")
+                cookies = login_mod._probe_cookie_valid(
+                    str(cookie_path), "http://example/ve", session_id="sid"
+                )
 
         self.assertEqual(cookies, {})
 
@@ -129,7 +225,9 @@ class CookieReuseTests(unittest.TestCase):
             ])
 
             with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                cookies = login_mod._probe_cookie_valid(str(cookie_path), "http://example/ve")
+                cookies = login_mod._probe_cookie_valid(
+                    str(cookie_path), "http://example/ve", session_id="sid"
+                )
 
         self.assertEqual(cookies, {})
 
@@ -149,7 +247,9 @@ class CookieReuseTests(unittest.TestCase):
             ])
 
             with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                cookies = login_mod._probe_cookie_valid(str(cookie_path), "http://example/ve")
+                cookies = login_mod._probe_cookie_valid(
+                    str(cookie_path), "http://example/ve", session_id="sid"
+                )
 
         self.assertEqual(cookies, {})
 

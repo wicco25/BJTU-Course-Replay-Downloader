@@ -12,8 +12,9 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
-from typing import Dict
+from typing import Dict, Tuple
 from urllib import parse
 
 import onnxruntime
@@ -88,7 +89,7 @@ BASE_HEADERS = {
 }
 
 REQUEST_TIMEOUT = (5, 15)
-DEFAULT_SESSION_ID = "9BEC92261A9FBC5ECF299C45D4C0468A"
+DEFAULT_SESSION_ID = ""
 
 
 def _new_session() -> requests.Session:
@@ -130,17 +131,73 @@ def _write_cookie_file(cookie_path: str, cookies: Dict[str, str]):
             pass
 
 
+def _extract_session_id_from_url(url: str) -> str:
+    if not url:
+        return ""
+    query = parse.parse_qs(parse.urlparse(url).query)
+    values = query.get("sessionId") or query.get("sessionid") or []
+    return values[0] if values else ""
+
+
+def _append_session_candidate(candidates, session_id: str):
+    if session_id and session_id not in candidates:
+        candidates.append(session_id)
+
+
+def _extract_session_id_from_text(text: str) -> str:
+    if not text:
+        return ""
+    match = re.search(r"sessionId=([A-Za-z0-9]+)", text)
+    return match.group(1) if match else ""
+
+
+def _extract_session_ids_from_text(text: str):
+    if not text:
+        return []
+    candidates = []
+    header_pattern = (
+        r"setRequestHeader\(\s*['\"]sessionId['\"]\s*,\s*['\"]([A-Za-z0-9]+)['\"]\s*\)"
+    )
+    for match in re.finditer(header_pattern, text):
+        _append_session_candidate(candidates, match.group(1))
+    for match in re.finditer(r"sessionId=([A-Za-z0-9]+)", text):
+        _append_session_candidate(candidates, match.group(1))
+    return candidates
+
+
+def _project_settings_path(script_dir: str) -> str:
+    return os.path.normpath(os.path.join(script_dir, "..", "settings.json"))
+
+
+def _write_project_session_id(script_dir: str, session_id: str):
+    if not session_id:
+        raise ValueError("session_id is empty")
+    settings_path = _project_settings_path(script_dir)
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        settings = {}
+    settings["session_id"] = session_id
+    tmp_path = settings_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, settings_path)
+
+
 def _request_probe_json(session: requests.Session, url: str,
                         params: Dict[str, object],
                         session_id: str) -> Dict[str, object]:
+    headers = {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if session_id:
+        headers["sessionId"] = session_id
     response = session.get(
         url,
         params=params,
-        headers={
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With": "XMLHttpRequest",
-            "sessionId": session_id,
-        },
+        headers=headers,
         allow_redirects=False,
         timeout=REQUEST_TIMEOUT,
     )
@@ -156,6 +213,8 @@ def _request_probe_json(session: requests.Session, url: str,
 
 def _probe_cookie_valid(cookie_path: str, base_url: str,
                         session_id: str = DEFAULT_SESSION_ID) -> Dict[str, str]:
+    if not session_id:
+        return {}
     cookies = _load_cookie_file(cookie_path)
     if not cookies:
         return {}
@@ -211,8 +270,57 @@ def _probe_cookie_valid(cookie_path: str, base_url: str,
     return refreshed
 
 
+def _probe_session_id_valid(session: requests.Session, base_url: str,
+                            session_id: str) -> bool:
+    if not session_id:
+        return False
+    try:
+        semester_url = (
+            f"{base_url.rstrip('/')}/back/rp/common/teachCalendar.shtml"
+        )
+        semester_data = _request_probe_json(
+            session, semester_url, {"method": "queryCurrentXq"}, session_id
+        )
+        if semester_data.get("STATUS") != "0":
+            return False
+        semesters = semester_data.get("result") or []
+        xq_code = ""
+        for semester in semesters:
+            if semester.get("currentFlag") == 2:
+                xq_code = semester.get("xqCode", "")
+                break
+        if not xq_code and semesters:
+            xq_code = semesters[0].get("xqCode", "")
+        if not xq_code:
+            return False
+
+        courses_url = f"{base_url.rstrip('/')}/back/coursePlatform/course.shtml"
+        course_data = _request_probe_json(
+            session,
+            courses_url,
+            {
+                "method": "getCourseList",
+                "pagesize": 1,
+                "page": 1,
+                "xqCode": xq_code,
+            },
+            session_id,
+        )
+    except requests.RequestException:
+        return False
+    return course_data.get("STATUS") == "0"
+
+
+def _select_valid_session_id(session: requests.Session, base_url: str,
+                             candidates) -> str:
+    for session_id in candidates:
+        if _probe_session_id_valid(session, base_url, session_id):
+            return session_id
+    return ""
+
+
 def _load_project_session_id(script_dir: str) -> str:
-    settings_path = os.path.normpath(os.path.join(script_dir, "..", "settings.json"))
+    settings_path = _project_settings_path(script_dir)
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
             settings = json.load(f)
@@ -306,7 +414,10 @@ def _follow_redirects(session: requests.Session, response: requests.Response):
     session.get(url, allow_redirects=True)
 
 
-def _platform_oauth_login(session: requests.Session):
+def _platform_oauth_login(
+    session: requests.Session,
+    base_url: str = "http://123.121.147.7:88/ve",
+) -> str:
     """通过 MIS 模块入口触发课程平台 OAuth 认证，获取已认证的 JSESSIONID
 
     认证链路:
@@ -326,18 +437,46 @@ def _platform_oauth_login(session: requests.Session):
         allow_redirects=False, timeout=REQUEST_TIMEOUT,
     )
     loc = resp.headers.get("Location", "")
+    candidates = []
+    _append_session_candidate(candidates, _extract_session_id_from_url(loc))
+    base_parts = parse.urlparse(base_url)
+    base_origin = f"{base_parts.scheme}://{base_parts.netloc}"
 
     # 2. 跟随 OAuth 重定向链直到完成
     for _ in range(10):
         if not loc:
             break
+        _append_session_candidate(candidates, _extract_session_id_from_url(loc))
         if loc.startswith("/"):
             if loc.startswith("/o/"):
                 loc = "https://cas.bjtu.edu.cn" + loc
             else:
-                loc = "http://123.121.147.7:88" + loc
+                loc = base_origin + loc
+        _append_session_candidate(candidates, _extract_session_id_from_url(loc))
         resp = session.get(loc, allow_redirects=False, timeout=REQUEST_TIMEOUT)
         loc = resp.headers.get("Location", "")
+        _append_session_candidate(candidates, _extract_session_id_from_url(loc))
+
+    selected_session_id = _select_valid_session_id(session, base_url, candidates)
+    if selected_session_id:
+        return selected_session_id
+
+    index_url = f"{base_url.rstrip('/')}/back/coursePlatform/coursePlatform.shtml"
+    try:
+        resp = session.get(
+            index_url,
+            params={"method": "toCoursePlatformIndex"},
+            allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
+        )
+        _append_session_candidate(candidates, _extract_session_id_from_url(getattr(resp, "url", "")))
+        _append_session_candidate(candidates, _extract_session_id_from_url(resp.headers.get("Location", "")))
+        for session_id in _extract_session_ids_from_text(resp.text):
+            _append_session_candidate(candidates, session_id)
+    except requests.RequestException:
+        pass
+
+    return _select_valid_session_id(session, base_url, candidates)
 
 
 
@@ -347,8 +486,9 @@ def _platform_oauth_login(session: requests.Session):
 # ============================================================
 
 
-def login(username: str, password: str, model_path: str,
-          base_url: str = "http://123.121.147.7:88/ve") -> Dict[str, str]:
+def login_state(username: str, password: str, model_path: str,
+                base_url: str = "http://123.121.147.7:88/ve",
+                fallback_session_id: str = "") -> Tuple[Dict[str, str], str]:
     """BJTU CAS 登录，返回 cookies_dict
 
     参数:
@@ -379,9 +519,20 @@ def login(username: str, password: str, model_path: str,
     _follow_redirects(session, response)
 
     # 6. 通过 MIS 模块入口触发课程平台 OAuth 认证，获取已认证的 JSESSIONID
-    _platform_oauth_login(session)
+    session_id = _platform_oauth_login(session, base_url)
+    if not session_id and _probe_session_id_valid(session, base_url, fallback_session_id):
+        session_id = fallback_session_id
+    if not session_id:
+        raise RuntimeError("Failed to extract course platform sessionId from login redirects")
 
-    return session.cookies.get_dict()
+    return session.cookies.get_dict(), session_id
+
+
+def login(username: str, password: str, model_path: str,
+          base_url: str = "http://123.121.147.7:88/ve") -> Dict[str, str]:
+    """BJTU CAS 鐧诲綍锛岃繑鍥?cookies_dict"""
+    cookies, _session_id = login_state(username, password, model_path, base_url)
+    return cookies
 
 
 # ============================================================
@@ -461,7 +612,7 @@ def main():
     # 执行登录
     root_cookie = os.path.join(script_dir, "..", "cookies.txt")
     session_id = args.session_id or _load_project_session_id(script_dir)
-    if not args.force_login:
+    if session_id and not args.force_login:
         cookies = _probe_cookie_valid(args.cookie, args.base_url, session_id)
         if cookies:
             _write_cookie_file(root_cookie, cookies)
@@ -470,7 +621,12 @@ def main():
             return
 
     try:
-        cookies = login(username, password, model_path, args.base_url)
+        cookies, new_session_id = login_state(
+            username, password, model_path, args.base_url,
+            fallback_session_id=session_id,
+        )
+        _write_project_session_id(script_dir, new_session_id)
+        print(f"[Info] Session ID synced to project settings: {_project_settings_path(script_dir)}")
     except Exception as e:
         print(f"[错误] 登录失败: {e}")
         sys.exit(1)

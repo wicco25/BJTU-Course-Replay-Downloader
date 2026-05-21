@@ -12,7 +12,7 @@ DEFAULT_CONFIG = {
     "transcript_dir": os.path.join(BASE_DIR, "transcripts"),
     "srt_dir": os.path.join(BASE_DIR, "subtitles"),
     "summary_dir": os.path.join(BASE_DIR, "summaries"),
-    "session_id": "9BEC92261A9FBC5ECF299C45D4C0468A",
+    "session_id": "",
     "api_key": "",
     "api_base_url": "https://api.openai.com/v1",
     "api_model": "gpt-4o",

@@ -73,7 +73,12 @@ class CourseCrawler:
     def _request_json(self, method, path, params=None, data=None,
                       extra_headers=None, allow_relogin=True):
         url = f"{self.base_url}{path}"
-        headers = {"sessionId": self.session_id}
+        if not self.session_id and allow_relogin:
+            if not self._refresh_login():
+                return {}
+        headers = {}
+        if self.session_id:
+            headers["sessionId"] = self.session_id
         if extra_headers:
             headers.update(extra_headers)
         try:
@@ -136,9 +141,9 @@ class CourseCrawler:
             self.cookie_file,
             "--base-url",
             self.base_url,
-            "--session-id",
-            self.session_id,
         ]
+        if self.session_id:
+            cmd.extend(["--session-id", self.session_id])
         try:
             result = subprocess.run(
                 cmd,
@@ -156,6 +161,8 @@ class CourseCrawler:
             return False
         print("[Crawler] 自动重新登录成功，已重新加载 Cookie")
         self._load_cookies()
+        cfg = load_config()
+        self.session_id = cfg.get("session_id", "")
         return True
 
     def _get_page(self, path, params=None):

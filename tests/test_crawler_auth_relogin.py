@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from crawler import CourseCrawler
@@ -35,10 +36,10 @@ class FakeSession:
 
 
 class CrawlerReloginTests(unittest.TestCase):
-    def make_crawler(self, responses):
+    def make_crawler(self, responses, session_id="sid"):
         crawler = CourseCrawler.__new__(CourseCrawler)
         crawler.base_url = "http://example/ve"
-        crawler.session_id = "sid"
+        crawler.session_id = session_id
         crawler.cookie_file = "cookies.txt"
         crawler.auto_relogin = True
         crawler._relogin_attempted = False
@@ -81,6 +82,33 @@ class CrawlerReloginTests(unittest.TestCase):
 
         self.assertEqual(result, {"STATUS": "0", "result": []})
         refresh.assert_called_once()
+
+    def test_api_get_refreshes_before_request_when_session_id_missing(self):
+        crawler = self.make_crawler([
+            FakeResponse(status_code=200, payload={"STATUS": "0", "result": []}),
+        ], session_id="")
+
+        def refresh():
+            crawler.session_id = "fresh"
+            return True
+
+        with patch.object(crawler, "_refresh_login", side_effect=refresh) as refresh_mock:
+            result = crawler._api_get("/back/rp/common/teachCalendar.shtml")
+
+        self.assertEqual(result, {"STATUS": "0", "result": []})
+        refresh_mock.assert_called_once()
+        self.assertEqual(crawler.session.calls[0][2]["headers"]["sessionId"], "fresh")
+
+    def test_refresh_login_reloads_session_id_from_settings(self):
+        crawler = self.make_crawler([], session_id="")
+
+        with patch("crawler.subprocess.run", return_value=SimpleNamespace(returncode=0)):
+            with patch("crawler.load_config", return_value={"session_id": "fresh"}):
+                with patch.object(crawler, "_load_cookies") as load_cookies:
+                    self.assertTrue(crawler._refresh_login())
+
+        load_cookies.assert_called_once()
+        self.assertEqual(crawler.session_id, "fresh")
 
 
 if __name__ == "__main__":
