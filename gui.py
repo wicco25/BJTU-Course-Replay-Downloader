@@ -435,13 +435,18 @@ class MainWindow(QMainWindow):
         self.audio_format_cb = QCheckBox("音频 M4A")
         self.audio_format_cb.setChecked(bool(self.cfg.get("download_audio_format", False)))
         self.audio_format_cb.stateChanged.connect(self._on_download_format_changed)
-        slayout.addWidget(self.audio_format_cb, 1, 1)
-        format_tip = QLabel(
-            "可同时勾选视频和音频。音频会从同一个 m3u8 流中本地抽取，"
-            "不会使用 ffmpeg 的 audio-only 拉流参数。"
+        audio_format_row = QHBoxLayout()
+        audio_format_row.addWidget(self.audio_format_cb)
+        audio_format_info = QLabel("!")
+        audio_format_info.setAlignment(Qt.AlignCenter)
+        audio_format_info.setFixedSize(18, 18)
+        audio_format_info.setToolTip("先下载视频再转换为 m4a 格式，单独勾选并不能省流量。")
+        audio_format_info.setStyleSheet(
+            "QLabel { border: 1px solid #777; border-radius: 9px; color: #555; font-weight: bold; }"
         )
-        format_tip.setWordWrap(True)
-        slayout.addWidget(format_tip, 2, 0, 1, 2)
+        audio_format_row.addWidget(audio_format_info)
+        audio_format_row.addStretch()
+        slayout.addLayout(audio_format_row, 1, 1)
         dl_layout.addWidget(sg)
 
         # 当前回放 URL
@@ -450,7 +455,8 @@ class MainWindow(QMainWindow):
         self.stream_url_tree = QTreeWidget()
         self.stream_url_tree.setHeaderLabels(["画面", "状态", "URL", "操作"])
         self.stream_url_tree.setRootIsDecorated(False)
-        self.stream_url_tree.setMaximumHeight(130)
+        self.stream_url_tree.setFixedHeight(156)
+        self.stream_url_tree.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.stream_url_tree.header().setSectionResizeMode(2, QHeaderView.Stretch)
         ul.addWidget(self.stream_url_tree)
         dl_layout.addWidget(ug)
@@ -465,6 +471,9 @@ class MainWindow(QMainWindow):
         pb.clicked.connect(lambda: self.path_edit.setText(
             QFileDialog.getExistingDirectory(self, "选择下载目录") or self.path_edit.text()))
         pl.addWidget(pb)
+        open_path_btn = QPushButton("打开")
+        open_path_btn.clicked.connect(lambda: self._open_download_dir(self.path_edit.text()))
+        pl.addWidget(open_path_btn)
         dl_layout.addWidget(pg)
 
         # 按钮
@@ -573,7 +582,7 @@ class MainWindow(QMainWindow):
         self.tr_label = QLabel("")
         tr_layout.addWidget(self.tr_label)
         tr_layout.addStretch()
-        tabs.addTab(tr_tab, "转写")
+        # 转写页面暂不展示，保留控件供旧逻辑和设置同步使用。
 
         # ===== Tab 3: 总结 =====
         sm_tab = QWidget()
@@ -612,7 +621,7 @@ class MainWindow(QMainWindow):
         self.sm_label = QLabel("")
         sm_layout.addWidget(self.sm_label)
         sm_layout.addStretch()
-        tabs.addTab(sm_tab, "总结")
+        # 总结页面暂不展示，保留控件供旧逻辑和设置同步使用。
 
         # ===== Tab 4: 设置 =====
         st_tab = QWidget()
@@ -625,6 +634,9 @@ class MainWindow(QMainWindow):
         ddb.clicked.connect(lambda: self.download_dir_edit.setText(
             QFileDialog.getExistingDirectory(self, "选择下载目录") or self.download_dir_edit.text()))
         ddr.addWidget(ddb)
+        ddo = QPushButton("打开")
+        ddo.clicked.connect(lambda: self._open_download_dir(self.download_dir_edit.text()))
+        ddr.addWidget(ddo)
         sf2.addRow("下载目录:", ddr)
         adr = QHBoxLayout()
         self.settings_audio_dir_edit = QLineEdit(self.cfg.get("audio_dir", ""))
@@ -766,7 +778,11 @@ class MainWindow(QMainWindow):
     def _on_calendar_loaded(self, data, course_id=None):
         if self.current_course and course_id and course_id != self.current_course.get("id"):
             return
-        self.calendar = data.get("calendar", [])
+        self.calendar = sorted(
+            data.get("calendar", []),
+            key=self._replay_sort_key,
+            reverse=True,
+        )
         if course_id:
             self.calendar_cache.set(course_id, self.calendar)
         with QSignalBlocker(self.replay_list):
@@ -783,6 +799,18 @@ class MainWindow(QMainWindow):
         self._on_replay_selection_changed()
         self._log(f"加载到 {len(self.calendar)} 次回放")
         self._mark_downloaded()
+
+    def _replay_sort_key(self, cal):
+        time_str = str(cal.get("courseBetween", "") or "")
+        for text, fmt in (
+            (time_str[:16], "%Y-%m-%d %H:%M"),
+            (time_str[:10], "%Y-%m-%d"),
+        ):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return datetime.min
 
     def _on_calendar_error(self, msg):
         self._loading_calendar = False
@@ -941,6 +969,19 @@ class MainWindow(QMainWindow):
     def _open_stream_url(self, url):
         if self._is_stream_available(url):
             webbrowser.open(url)
+
+    def _open_download_dir(self, path):
+        path = (path or "").strip() or self.cfg.get("download_dir", "")
+        if not path:
+            QMessageBox.warning(self, "提示", "请先设置保存目录")
+            return
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "提示", f"保存目录不存在:\n{path}")
+            return
+        try:
+            os.startfile(path)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"无法打开保存目录:\n{e}")
 
     def _start_single_stream_download(self, stream_key):
         item = self._current_replay_item()
@@ -1139,7 +1180,6 @@ class MainWindow(QMainWindow):
         self._append_audio_files(data.get("downloaded_files", []))
         if data.get("audio_only") and self.tr_file_list.count() > 0:
             self._log("音频已加入转写列表")
-            self.tabs.setCurrentIndex(1)
 
     def _on_batch_dl_error(self, batch_id, msg):
         self._download_batches.pop(batch_id, None)
@@ -1332,8 +1372,6 @@ class MainWindow(QMainWindow):
         self.transcribe_btn.setEnabled(True)
         self.transcribe_selected_btn.setEnabled(True)
         self._refresh_summary_list()
-        if self.sm_file_list.count() > 0:
-            self.tabs.setCurrentIndex(2)
 
     # ========================= 总结 =========================
 
