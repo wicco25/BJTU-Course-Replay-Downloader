@@ -4,3 +4,6 @@ faster-whisper>=1.0
 PyQt5>=5.15
 openai>=1.0
 yt-dlp>=2024.12.13
+onnxruntime>=1.20.1
+numpy
+pillow>=11.0.0
