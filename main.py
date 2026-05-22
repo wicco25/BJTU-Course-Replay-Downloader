@@ -7,8 +7,6 @@
 
 import sys
 import os
-import json
-from datetime import datetime
 
 
 def _clear_dead_proxy_env():
@@ -34,15 +32,11 @@ def run_cli():
     """命令行交互模式"""
     from crawler import CourseCrawler
     from downloader import VideoDownloader
-    from transcriber import Transcriber
-    from summarizer import Summarizer
     from config import load_config
 
     cfg = load_config()
     c = CourseCrawler()
     dl = VideoDownloader(c)
-    tr = Transcriber()
-    sm = Summarizer()
 
     # 1. 选择学期
     semesters = c.get_semesters()
@@ -130,52 +124,6 @@ def run_cli():
         return
 
     print(f"\n下载完成: {result}")
-
-    # 6. 是否转写
-    do_transcribe = input("\n是否转写? (y/N): ").strip().lower() == "y"
-    if do_transcribe:
-        audio_path = result if audio_only else None
-        if not audio_only:
-            # 先提取音频
-            audio_path = result.replace(".mp4", ".mp3")
-            print("提取音频...")
-            dl.extract_audio(result, audio_path)
-
-        print("开始转写...")
-        transcript, out_path = tr.transcribe_to_file(
-            audio_path,
-            progress_callback=lambda pct: print(
-                f"\r转写进度: {int(pct*100)}%", end="", flush=True
-            ),
-        )
-        print(f"\n转写完成: {out_path}")
-
-        # 7. 是否总结
-        do_summary = input("\n是否总结? (y/N): ").strip().lower() == "y"
-        if do_summary:
-            print("开始总结...")
-            api_key = input("API Key: ").strip()
-            api_url = input(f"API地址 [{cfg['api_base_url']}]: ").strip()
-            api_model = input(f"模型 [{cfg['api_model']}]: ").strip()
-
-            if api_key:
-                cfg["api_key"] = api_key
-            if api_url:
-                cfg["api_base_url"] = api_url
-            if api_model:
-                cfg["api_model"] = api_model
-
-            sm.cfg = cfg
-            summary = sm.summarize(
-                transcript["full_text"],
-                progress_callback=lambda pct: print(
-                    f"\r总结进度: {int(pct*100)}%", end="", flush=True
-                ),
-            )
-            sum_path = out_path.replace("_transcript.json", "_summary.md")
-            sm.save_summary(summary, sum_path)
-            print(f"\n总结完成: {sum_path}")
-            print(f"\n总结内容:\n{summary[:500]}...")
 
 
 if __name__ == "__main__":

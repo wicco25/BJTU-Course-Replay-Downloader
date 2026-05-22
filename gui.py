@@ -2,7 +2,6 @@
 
 import os
 import sys
-import json
 import threading
 import webbrowser
 from datetime import datetime
@@ -33,15 +32,12 @@ from PyQt5.QtGui import QBrush, QColor, QFont
 
 from crawler import CourseCrawler
 from downloader import VideoDownloader
-from transcriber import Transcriber
-from summarizer import Summarizer
 from config import load_config, save_config
 from performance_utils import (
     MemoryCache,
     ProgressThrottler,
     build_download_stream_index,
     bounded_worker_count,
-    is_audio_file,
     is_complete_file,
     prefetch_stream_infos,
     run_limited_concurrent,
@@ -113,22 +109,6 @@ class CrawlerWorker(QThread):
 
             elif self.task == "batch_download":
                 self._run_batch_download()
-
-            elif self.task == "batch_transcribe":
-                self._run_batch_transcribe()
-
-            elif self.task == "summarize":
-                sm = Summarizer()
-                text = self.kwargs["text"]
-                result = sm.summarize(
-                    text,
-                    progress_callback=lambda pct: self.signals.progress.emit(
-                        int(pct * 100), "总结中..."),
-                )
-                out = self.kwargs.get("output_path")
-                if out:
-                    sm.save_summary(result, out)
-                self.signals.finished.emit({"summary": result, "output_path": out})
 
         except Exception as e:
             self.signals.error.emit(str(e))
@@ -282,42 +262,6 @@ class CrawlerWorker(QThread):
             "audio_only": audio_only_batch,
         })
 
-    # ---- 批量转写 ----
-
-    def _run_batch_transcribe(self):
-        files = self.kwargs["files"]       # list of audio file paths
-        model_size = self.kwargs.get("model_size", "large-v3-turbo")
-        out_dir = self.kwargs.get("out_dir", "")
-        os.makedirs(out_dir, exist_ok=True)
-
-        tr = Transcriber()
-        total = len(files)
-
-        for i, audio_path in enumerate(files):
-            name = os.path.basename(audio_path)
-            self.signals.log.emit(f"[{i+1}/{total}] 转写: {name}")
-            base = os.path.splitext(name)[0]
-            out_path = os.path.join(out_dir, base + "_transcript.json")
-
-            last_pct = [0]
-
-            def progress_cb(pct, idx=i, tot=total):
-                p = int(pct * 100)
-                overall = int((idx / tot + pct / tot) * 100)
-                self.signals.progress.emit(overall, f"[{idx+1}/{tot}] 转写中 {p}%")
-
-            try:
-                result, saved = tr.transcribe_to_file(
-                    audio_path, output_path=out_path,
-                    progress_callback=progress_cb, model_size=model_size)
-                self.signals.item_done.emit(i, saved)
-            except Exception as e:
-                self.signals.item_fail.emit(i, str(e))
-
-        self.signals.progress.emit(100, "批量转写完成")
-        self.signals.finished.emit({"batch": "transcribe_complete"})
-
-
 # ================================================================
 # 主窗口
 # ================================================================
@@ -330,7 +274,6 @@ class MainWindow(QMainWindow):
         self.courses = []
         self.calendar = []
         self.current_course = None
-        self.transcript_result = None
         self.worker = None
         self.workers = []
         self.semester_cache = MemoryCache()
@@ -484,10 +427,6 @@ class MainWindow(QMainWindow):
         self.dl_btn.setEnabled(False)
         bl.addWidget(self.dl_btn)
 
-        self.dl_audio_btn = QPushButton("下载选中 (仅音频)")
-        self.dl_audio_btn.clicked.connect(lambda: self._start_batch_download(audio_only=True))
-        self.dl_audio_btn.setEnabled(False)
-        self.dl_audio_btn.hide()
         dl_layout.addLayout(bl)
         self._update_download_button_text()
 
@@ -508,122 +447,7 @@ class MainWindow(QMainWindow):
         dl_layout.addStretch()
         tabs.addTab(dl_tab, "下载")
 
-        # ===== Tab 2: 转写 =====
-        tr_tab = QWidget()
-        tr_layout = QVBoxLayout(tr_tab)
-
-        tf = QFormLayout()
-        self.audio_dir_edit = QLineEdit(self.cfg.get("audio_dir", ""))
-        self.audio_dir_edit.setPlaceholderText("选择音频所在目录...")
-        ar = QHBoxLayout()
-        ar.addWidget(self.audio_dir_edit)
-        ab = QPushButton("浏览目录")
-        ab.clicked.connect(self._browse_audio_dir)
-        ar.addWidget(ab)
-        tf.addRow("音频目录:", ar)
-
-        self.tr_out_dir_edit = QLineEdit(self.cfg.get("transcript_dir", ""))
-        self.tr_out_dir_edit.setPlaceholderText("转写输出目录...")
-        odr = QHBoxLayout()
-        odr.addWidget(self.tr_out_dir_edit)
-        odb = QPushButton("浏览目录")
-        odb.clicked.connect(self._browse_transcript_out_dir)
-        odr.addWidget(odb)
-        tf.addRow("输出目录:", odr)
-
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"])
-        idx = self.model_combo.findText(self.cfg.get("whisper_model", "large-v3-turbo"))
-        if idx >= 0:
-            self.model_combo.setCurrentIndex(idx)
-        tf.addRow("Whisper模型:", self.model_combo)
-
-        self.lang_combo = QComboBox()
-        self.lang_combo.addItems(["zh", "en", "auto"])
-        idx = self.lang_combo.findText(self.cfg.get("whisper_language", "zh"))
-        if idx >= 0:
-            self.lang_combo.setCurrentIndex(idx)
-        tf.addRow("语言:", self.lang_combo)
-
-        self.device_combo = QComboBox()
-        self.device_combo.addItems(["auto", "cuda", "cpu"])
-        idx = self.device_combo.findText(self.cfg.get("whisper_device", "auto"))
-        if idx >= 0:
-            self.device_combo.setCurrentIndex(idx)
-        self.device_combo.currentTextChanged.connect(self._on_device_changed)
-        tf.addRow("设备:", self.device_combo)
-        tr_layout.addLayout(tf)
-
-        # 文件列表
-        tr_layout.addWidget(QLabel("待转写文件:"))
-        self.tr_file_list = QListWidget()
-        self.tr_file_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.tr_file_list.setMaximumHeight(130)
-        tr_layout.addWidget(self.tr_file_list)
-
-        tr_btn_row = QHBoxLayout()
-        self.refresh_audio_btn = QPushButton("刷新列表")
-        self.refresh_audio_btn.clicked.connect(self._refresh_audio_list)
-        tr_btn_row.addWidget(self.refresh_audio_btn)
-
-        self.transcribe_btn = QPushButton("批量转写")
-        self.transcribe_btn.setMinimumHeight(36)
-        self.transcribe_btn.clicked.connect(self._start_batch_transcribe)
-        tr_btn_row.addWidget(self.transcribe_btn)
-
-        self.transcribe_selected_btn = QPushButton("转写选中")
-        self.transcribe_selected_btn.setMinimumHeight(36)
-        self.transcribe_selected_btn.clicked.connect(self._start_transcribe_selected)
-        tr_btn_row.addWidget(self.transcribe_selected_btn)
-        tr_layout.addLayout(tr_btn_row)
-
-        self.tr_progress = QProgressBar()
-        tr_layout.addWidget(self.tr_progress)
-        self.tr_label = QLabel("")
-        tr_layout.addWidget(self.tr_label)
-        tr_layout.addStretch()
-        # 转写页面暂不展示，保留控件供旧逻辑和设置同步使用。
-
-        # ===== Tab 3: 总结 =====
-        sm_tab = QWidget()
-        sm_layout = QVBoxLayout(sm_tab)
-
-        sf = QFormLayout()
-        self.api_key_edit = QLineEdit(self.cfg.get("api_key", ""))
-        self.api_key_edit.setEchoMode(QLineEdit.Password)
-        self.api_key_edit.setPlaceholderText("sk-...")
-        sf.addRow("API Key:", self.api_key_edit)
-        self.api_url_edit = QLineEdit(self.cfg.get("api_base_url", "https://api.openai.com/v1"))
-        sf.addRow("API地址:", self.api_url_edit)
-        self.api_model_edit = QLineEdit(self.cfg.get("api_model", "gpt-4o"))
-        sf.addRow("模型:", self.api_model_edit)
-        sm_layout.addLayout(sf)
-
-        sm_layout.addWidget(QLabel("转录文件:"))
-        self.sm_file_list = QListWidget()
-        self.sm_file_list.setMaximumHeight(100)
-        sm_layout.addWidget(self.sm_file_list)
-        sm_btn_row = QHBoxLayout()
-        refresh_sm_btn = QPushButton("刷新")
-        refresh_sm_btn.clicked.connect(self._refresh_summary_list)
-        sm_btn_row.addWidget(refresh_sm_btn)
-        self.merge_cb = QCheckBox("合并所有转录文件一起总结")
-        sm_btn_row.addWidget(self.merge_cb)
-        sm_btn_row.addStretch()
-        sm_layout.addLayout(sm_btn_row)
-
-        self.summarize_btn = QPushButton("开始总结")
-        self.summarize_btn.setMinimumHeight(36)
-        self.summarize_btn.clicked.connect(self._start_summarize)
-        sm_layout.addWidget(self.summarize_btn)
-        self.sm_progress = QProgressBar()
-        sm_layout.addWidget(self.sm_progress)
-        self.sm_label = QLabel("")
-        sm_layout.addWidget(self.sm_label)
-        sm_layout.addStretch()
-        # 总结页面暂不展示，保留控件供旧逻辑和设置同步使用。
-
-        # ===== Tab 4: 设置 =====
+        # ===== Tab 2: 设置 =====
         st_tab = QWidget()
         st_layout = QVBoxLayout(st_tab)
         sf2 = QFormLayout()
@@ -638,22 +462,6 @@ class MainWindow(QMainWindow):
         ddo.clicked.connect(lambda: self._open_download_dir(self.download_dir_edit.text()))
         ddr.addWidget(ddo)
         sf2.addRow("下载目录:", ddr)
-        adr = QHBoxLayout()
-        self.settings_audio_dir_edit = QLineEdit(self.cfg.get("audio_dir", ""))
-        adr.addWidget(self.settings_audio_dir_edit)
-        adb = QPushButton("浏览")
-        adb.clicked.connect(lambda: self.settings_audio_dir_edit.setText(
-            QFileDialog.getExistingDirectory(self, "选择音频目录") or self.settings_audio_dir_edit.text()))
-        adr.addWidget(adb)
-        sf2.addRow("音频目录:", adr)
-        tdr = QHBoxLayout()
-        self.settings_tr_dir_edit = QLineEdit(self.cfg.get("transcript_dir", ""))
-        tdr.addWidget(self.settings_tr_dir_edit)
-        tdb = QPushButton("浏览")
-        tdb.clicked.connect(lambda: self.settings_tr_dir_edit.setText(
-            QFileDialog.getExistingDirectory(self, "选择转写输出目录") or self.settings_tr_dir_edit.text()))
-        tdr.addWidget(tdb)
-        sf2.addRow("转写输出目录:", tdr)
         self.session_id_edit = QLineEdit(self.cfg.get("session_id", ""))
         sf2.addRow("Session ID:", self.session_id_edit)
         perf_note = QLabel(
@@ -824,7 +632,6 @@ class MainWindow(QMainWindow):
         self.replay_count_label.setText(f"已选: {count}")
         enable = count > 0 and self.current_course is not None
         self.dl_btn.setEnabled(enable)
-        self.dl_audio_btn.setEnabled(enable)
         if selected and self.replay_list.currentItem() is None:
             self.replay_list.setCurrentItem(selected[0])
         elif not selected:
@@ -1177,9 +984,6 @@ class MainWindow(QMainWindow):
         self._on_replay_selection_changed()
         self._mark_downloaded()
         self._render_stream_url_table(self._current_stream_info)
-        self._append_audio_files(data.get("downloaded_files", []))
-        if data.get("audio_only") and self.tr_file_list.count() > 0:
-            self._log("音频已加入转写列表")
 
     def _on_batch_dl_error(self, batch_id, msg):
         self._download_batches.pop(batch_id, None)
@@ -1241,223 +1045,6 @@ class MainWindow(QMainWindow):
                 item.setText(f"○ {current_text}")
                 item.setForeground(BRUSH_NORMAL)
 
-    # ========================= 转写 =========================
-
-    def _on_device_changed(self, device):
-        self.cfg["whisper_device"] = device
-
-    def _browse_audio_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "选择音频所在目录")
-        if path:
-            self.audio_dir_edit.setText(path)
-            self.cfg["audio_dir"] = path
-            save_config(self.cfg)
-            self._refresh_audio_list()
-
-    def _browse_transcript_out_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "选择转写输出目录")
-        if path:
-            self.tr_out_dir_edit.setText(path)
-            self.cfg["transcript_dir"] = path
-            save_config(self.cfg)
-
-    def _refresh_audio_list(self):
-        self.tr_file_list.clear()
-        # 从音频目录收集
-        audio_dir = self.audio_dir_edit.text()
-        dirs_to_scan = []
-        if audio_dir and os.path.exists(audio_dir):
-            dirs_to_scan.append(audio_dir)
-        # 也从下载目录收集
-        dl_dir = self.path_edit.text() or self.cfg["download_dir"]
-        if dl_dir and os.path.exists(dl_dir) and dl_dir not in dirs_to_scan:
-            dirs_to_scan.append(dl_dir)
-
-        seen = set()
-        for d in dirs_to_scan:
-            for root, _, files in os.walk(d):
-                for f in files:
-                    if is_audio_file(f):
-                        full = os.path.join(root, f)
-                        if full not in seen:
-                            seen.add(full)
-                            item = QListWidgetItem(f)
-                            item.setData(Qt.UserRole, full)
-                            self.tr_file_list.addItem(item)
-
-        self._log(f"扫描到 {self.tr_file_list.count()} 个音频文件")
-        if self.tr_file_list.count() > 0:
-            self.tr_file_list.setCurrentRow(0)
-
-    def _append_audio_files(self, paths):
-        if not paths:
-            return
-        existing = {
-            self.tr_file_list.item(i).data(Qt.UserRole)
-            for i in range(self.tr_file_list.count())
-        }
-        added = 0
-        for full in paths:
-            if not is_audio_file(full) or full in existing:
-                continue
-            item = QListWidgetItem(os.path.basename(full))
-            item.setData(Qt.UserRole, full)
-            self.tr_file_list.addItem(item)
-            existing.add(full)
-            added += 1
-        if added:
-            self._log(f"新增 {added} 个音频文件到转写列表")
-            self.tr_file_list.setCurrentRow(self.tr_file_list.count() - 1)
-
-    def _get_transcribe_files(self):
-        """获取待转写的文件列表"""
-        if self.tr_file_list.count() == 0:
-            self._refresh_audio_list()
-        return [self.tr_file_list.item(i).data(Qt.UserRole)
-                for i in range(self.tr_file_list.count())]
-
-    def _start_batch_transcribe(self):
-        files = self._get_transcribe_files()
-        if not files:
-            QMessageBox.warning(self, "提示", "没有找到音频文件，请先下载音频或选择目录")
-            return
-        self._do_transcribe(files)
-
-    def _start_transcribe_selected(self):
-        selected = self.tr_file_list.selectedItems()
-        if not selected:
-            QMessageBox.warning(self, "提示", "请在文件列表中选中要转写的文件")
-            return
-        files = [it.data(Qt.UserRole) for it in selected]
-        self._do_transcribe(files)
-
-    def _do_transcribe(self, files):
-        # 持久化当前设置
-        self.cfg["whisper_device"] = self.device_combo.currentText()
-        self.cfg["whisper_model"] = self.model_combo.currentText()
-        self.cfg["whisper_language"] = self.lang_combo.currentText()
-        self.cfg["transcript_dir"] = self.tr_out_dir_edit.text()
-        save_config(self.cfg)
-        cfg = load_config()
-        out_dir = self.tr_out_dir_edit.text() or cfg.get("transcript_dir", "")
-        os.makedirs(out_dir, exist_ok=True)
-
-        self._log(f"开始批量转写: {len(files)} 个文件")
-        self.transcribe_btn.setEnabled(False)
-        self.transcribe_selected_btn.setEnabled(False)
-        self.tr_progress.setValue(0)
-
-        self._run_worker("batch_transcribe",
-                         files=files, model_size=self.model_combo.currentText(),
-                         out_dir=out_dir,
-                         _on=self._on_batch_tr_done,
-                         _progress=self._on_tr_progress,
-                         _item_done=self._on_tr_item_done,
-                         _item_fail=self._on_tr_item_fail)
-
-    def _on_tr_progress(self, value, msg):
-        self.tr_progress.setValue(min(value, 100))
-        self.tr_label.setText(msg)
-
-    def _on_tr_item_done(self, idx, path):
-        self._log(f"  [{idx+1}] 转写完成: {os.path.basename(path)}")
-
-    def _on_tr_item_fail(self, idx, reason):
-        self._log(f"  [{idx+1}] 转写失败: {reason}")
-
-    def _on_batch_tr_done(self, data):
-        self._log("批量转写结束")
-        self.tr_progress.setValue(100)
-        self.tr_label.setText("转写完成")
-        self.transcribe_btn.setEnabled(True)
-        self.transcribe_selected_btn.setEnabled(True)
-        self._refresh_summary_list()
-
-    # ========================= 总结 =========================
-
-    def _refresh_summary_list(self):
-        self.sm_file_list.clear()
-        cfg = load_config()
-        tr_dir = cfg.get("transcript_dir",
-                         os.path.join(os.path.dirname(__file__), "transcripts"))
-        if os.path.exists(tr_dir):
-            for f in sorted(os.listdir(tr_dir)):
-                if f.endswith("_transcript.json"):
-                    item = QListWidgetItem(f)
-                    item.setData(Qt.UserRole, os.path.join(tr_dir, f))
-                    self.sm_file_list.addItem(item)
-        self._log(f"扫描到 {self.sm_file_list.count()} 个转录文件")
-        if self.sm_file_list.count() > 0:
-            self.sm_file_list.setCurrentRow(self.sm_file_list.count() - 1)
-
-    def _start_summarize(self):
-        # 更新 API 配置
-        self.cfg["api_key"] = self.api_key_edit.text()
-        self.cfg["api_base_url"] = self.api_url_edit.text()
-        self.cfg["api_model"] = self.api_model_edit.text()
-        save_config(self.cfg)
-
-        merge = self.merge_cb.isChecked()
-        if merge:
-            # 合并所有
-            texts = []
-            for i in range(self.sm_file_list.count()):
-                path = self.sm_file_list.item(i).data(Qt.UserRole)
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    texts.append(data.get("full_text", ""))
-            if not texts:
-                QMessageBox.warning(self, "提示", "没有可用的转录文件")
-                return
-            text = "\n\n---\n\n".join(texts)
-            self._log(f"合并 {len(texts)} 个转录文件，总长度: {len(text)} 字符")
-        else:
-            selected = self.sm_file_list.selectedItems()
-            if not selected:
-                QMessageBox.warning(self, "提示", "请选中一个转录文件，或勾选'合并所有'")
-                return
-            path = selected[0].data(Qt.UserRole)
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            text = data.get("full_text", "")
-            segs = data.get("segments", [])
-            if not text:
-                text = "".join(s.get("text", "") for s in segs)
-
-        if not text.strip():
-            QMessageBox.warning(self, "提示", "转写文本为空")
-            return
-
-        self._log(f"开始总结，文本长度: {len(text)} 字符")
-        self.summarize_btn.setEnabled(False)
-        self.sm_progress.setValue(0)
-
-        cfg = load_config()
-        out_dir = cfg.get("summary_dir",
-                          os.path.join(os.path.dirname(__file__), "summaries"))
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir,
-                                f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md")
-
-        self._run_worker("summarize", text=text, output_path=out_path,
-                         _on=self._on_summarize_done,
-                         _progress=self._on_sm_progress)
-
-    def _on_sm_progress(self, value, msg):
-        self.sm_progress.setValue(min(value, 100))
-        self.sm_label.setText(msg)
-
-    def _on_summarize_done(self, data):
-        summary = data.get("summary", "")
-        out_path = data.get("output_path", "")
-        self._log(f"总结完成: {out_path}")
-        self.sm_progress.setValue(100)
-        self.sm_label.setText("总结完成")
-        self.summarize_btn.setEnabled(True)
-        QMessageBox.information(self, "完成",
-                                f"总结完成:\n{out_path}\n\n"
-                                f"预览:\n{summary[:300]}...")
-
     # ========================= 通用方法 =========================
 
     def _run_worker(self, task, _on=None, _progress=None, _error=None,
@@ -1493,10 +1080,6 @@ class MainWindow(QMainWindow):
         self._log(f"错误: {msg}")
         QMessageBox.critical(self, "错误", msg)
         self.dl_btn.setEnabled(True)
-        self.dl_audio_btn.setEnabled(True)
-        self.transcribe_btn.setEnabled(True)
-        self.transcribe_selected_btn.setEnabled(True)
-        self.summarize_btn.setEnabled(True)
 
     def _log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1511,8 +1094,6 @@ class MainWindow(QMainWindow):
             return max(lower, min(upper, value))
 
         self.cfg["download_dir"] = self.download_dir_edit.text()
-        self.cfg["audio_dir"] = self.settings_audio_dir_edit.text()
-        self.cfg["transcript_dir"] = self.settings_tr_dir_edit.text()
         self.cfg["session_id"] = self.session_id_edit.text()
         self.cfg["segment_workers"] = read_int(self.segment_workers_edit, 16, 4, 32)
         self.cfg["use_ytdlp"] = self.use_ytdlp_cb.isChecked()
@@ -1521,17 +1102,9 @@ class MainWindow(QMainWindow):
         self.cfg["stream_prefetch_workers"] = read_int(self.prefetch_workers_edit, 4, 1, 8)
         self.cfg["download_video_format"] = self.video_format_cb.isChecked()
         self.cfg["download_audio_format"] = self.audio_format_cb.isChecked()
-        self.cfg["api_key"] = self.api_key_edit.text()
-        self.cfg["api_base_url"] = self.api_url_edit.text()
-        self.cfg["api_model"] = self.api_model_edit.text()
-        self.cfg["whisper_model"] = self.model_combo.currentText()
-        self.cfg["whisper_language"] = self.lang_combo.currentText()
-        self.cfg["whisper_device"] = self.device_combo.currentText()
         save_config(self.cfg)
-        # 同步到转写 tab 的编辑框
+        # 同步到下载页的编辑框
         self.path_edit.setText(self.cfg["download_dir"])
-        self.audio_dir_edit.setText(self.cfg["audio_dir"])
-        self.tr_out_dir_edit.setText(self.cfg["transcript_dir"])
         self._log("设置已保存")
         QMessageBox.information(self, "设置", "设置已保存")
 
