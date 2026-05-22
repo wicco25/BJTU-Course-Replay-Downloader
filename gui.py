@@ -618,8 +618,6 @@ class MainWindow(QMainWindow):
         st_tab = QWidget()
         st_layout = QVBoxLayout(st_tab)
         sf2 = QFormLayout()
-        self.cookie_edit = QLineEdit(self.cfg.get("cookie_file", ""))
-        sf2.addRow("Cookie文件:", self.cookie_edit)
         ddr = QHBoxLayout()
         self.download_dir_edit = QLineEdit(self.cfg.get("download_dir", ""))
         ddr.addWidget(self.download_dir_edit)
@@ -1474,7 +1472,6 @@ class MainWindow(QMainWindow):
                 value = default
             return max(lower, min(upper, value))
 
-        self.cfg["cookie_file"] = self.cookie_edit.text()
         self.cfg["download_dir"] = self.download_dir_edit.text()
         self.cfg["audio_dir"] = self.settings_audio_dir_edit.text()
         self.cfg["transcript_dir"] = self.settings_tr_dir_edit.text()

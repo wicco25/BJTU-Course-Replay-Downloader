@@ -2,10 +2,10 @@
 """BJTU CAS 登录模块 — 独立可复用
 
 用法：
-    python login.py [--account account.txt] [--cookie cookie.txt] [--model omis.onnx] [--base-url URL]
+    python login.py [--account account.txt] [--model omis.onnx] [--base-url URL]
 
     account.txt 格式：第一行为 用户名,密码
-    cookie.txt 输出：key=value 逐行格式，供爬虫直接读取
+    Cookie 和 sessionId 会写入项目根目录 settings.json
 """
 
 import argparse
@@ -99,38 +99,6 @@ def _new_session() -> requests.Session:
     return session
 
 
-def _load_cookie_file(cookie_path: str) -> Dict[str, str]:
-    cookies = {}
-    if not os.path.exists(cookie_path):
-        return cookies
-    with open(cookie_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            cookies[key.strip()] = value.strip()
-    return cookies
-
-
-def _write_cookie_file(cookie_path: str, cookies: Dict[str, str]):
-    os.makedirs(os.path.dirname(os.path.abspath(cookie_path)), exist_ok=True)
-    tmp_path = cookie_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        for key, value in cookies.items():
-            f.write(f"{key}={value}\n")
-    try:
-        os.replace(tmp_path, cookie_path)
-    except PermissionError:
-        with open(cookie_path, "w", encoding="utf-8") as f:
-            for key, value in cookies.items():
-                f.write(f"{key}={value}\n")
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-
 def _extract_session_id_from_url(url: str) -> str:
     if not url:
         return ""
@@ -169,9 +137,23 @@ def _project_settings_path(script_dir: str) -> str:
     return os.path.normpath(os.path.join(script_dir, "..", "settings.json"))
 
 
-def _write_project_session_id(script_dir: str, session_id: str):
+def _load_project_cookies(script_dir: str) -> Dict[str, str]:
+    settings_path = _project_settings_path(script_dir)
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    cookies = settings.get("cookies") or {}
+    return cookies if isinstance(cookies, dict) else {}
+
+
+def _write_project_auth_state(script_dir: str, session_id: str,
+                              cookies: Dict[str, str]):
     if not session_id:
         raise ValueError("session_id is empty")
+    if not cookies:
+        raise ValueError("cookies is empty")
     settings_path = _project_settings_path(script_dir)
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
@@ -179,6 +161,7 @@ def _write_project_session_id(script_dir: str, session_id: str):
     except (OSError, ValueError):
         settings = {}
     settings["session_id"] = session_id
+    settings["cookies"] = dict(cookies)
     tmp_path = settings_path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2, ensure_ascii=False)
@@ -211,11 +194,10 @@ def _request_probe_json(session: requests.Session, url: str,
         return {}
 
 
-def _probe_cookie_valid(cookie_path: str, base_url: str,
+def _probe_cookie_valid(cookies: Dict[str, str], base_url: str,
                         session_id: str = DEFAULT_SESSION_ID) -> Dict[str, str]:
     if not session_id:
         return {}
-    cookies = _load_cookie_file(cookie_path)
     if not cookies:
         return {}
 
@@ -550,11 +532,6 @@ def main():
         help="账号文件路径，第一行为 用户名,密码（默认 account.txt）",
     )
     parser.add_argument(
-        "--cookie",
-        default="cookie.txt",
-        help="Cookie 输出文件路径（默认 cookie.txt）",
-    )
-    parser.add_argument(
         "--model",
         default=None,
         help="ONNX 模型路径（默认 ./omis.onnx 或 ../src/omis.onnx）",
@@ -610,14 +587,13 @@ def main():
     print(f"[信息] 目标: {args.base_url}")
 
     # 执行登录
-    root_cookie = os.path.join(script_dir, "..", "cookies.txt")
     session_id = args.session_id or _load_project_session_id(script_dir)
+    saved_cookies = _load_project_cookies(script_dir)
     if session_id and not args.force_login:
-        cookies = _probe_cookie_valid(args.cookie, args.base_url, session_id)
+        cookies = _probe_cookie_valid(saved_cookies, args.base_url, session_id)
         if cookies:
-            _write_cookie_file(root_cookie, cookies)
-            print(f"[Info] Existing cookie is valid, skipped CAS login: {args.cookie}")
-            print(f"[Info] Cookie synced to project root: {root_cookie}")
+            _write_project_auth_state(script_dir, session_id, cookies)
+            print("[Info] Existing settings.json cookies are valid, skipped CAS login")
             return
 
     try:
@@ -625,23 +601,14 @@ def main():
             username, password, model_path, args.base_url,
             fallback_session_id=session_id,
         )
-        _write_project_session_id(script_dir, new_session_id)
-        print(f"[Info] Session ID synced to project settings: {_project_settings_path(script_dir)}")
+        _write_project_auth_state(script_dir, new_session_id, cookies)
+        print(f"[Info] Auth state synced to project settings: {_project_settings_path(script_dir)}")
     except Exception as e:
         print(f"[错误] 登录失败: {e}")
         sys.exit(1)
 
     print(f"[成功] Cookie 数量: {len(cookies)}")
-
-    # 写入本地 cookie 文件
-    _write_cookie_file(args.cookie, cookies)
-    print(f"[信息] Cookie 已写入: {args.cookie}")
-
-    # 同时替换根目录 cookies.txt
-    if os.path.abspath(args.cookie) != os.path.abspath(root_cookie):
-        _write_cookie_file(root_cookie, cookies)
-        print(f"[信息] 已同步到根目录: {root_cookie}")
-
+    print("[信息] Cookie 已写入 settings.json")
 
 if __name__ == "__main__":
     main()

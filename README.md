@@ -43,8 +43,7 @@ audio/           # 音频文件
 transcripts/     # 转写结果
 subtitles/       # 字幕文件
 summaries/       # 总结文件
-cookies.txt      # 平台 Cookie，本地敏感文件
-settings.json    # 本地配置，本地敏感文件
+settings.json    # 本地配置，包含 Cookie 和 sessionId，本地敏感文件
 ```
 
 这些目录和敏感配置已在 `.gitignore` 中排除。
@@ -93,7 +92,7 @@ python -m pip install -r standalone-login/requirements.txt
 | 配置项 | 作用 |
 | --- | --- |
 | `base_url` | 课程平台地址 |
-| `cookie_file` | Cookie 文件路径 |
+| `cookies` | 登录脚本写入的 Cookie 字典，保存在本地 `settings.json` |
 | `download_dir` | 下载目录 |
 | `audio_dir` | 音频目录 |
 | `transcript_dir` | 转写输出目录 |
@@ -111,7 +110,7 @@ GUI 的“设置”页可以修改大部分常用配置。
 
 ## 获取 Cookie
 
-课程接口依赖有效 Cookie。可以使用 `standalone-login/login.py` 自动登录并写入 Cookie。
+课程接口依赖有效 Cookie 和接口请求头使用的 `sessionId`。可以使用 `standalone-login/login.py` 自动登录，脚本会把二者直接写入项目根目录 `settings.json`。
 
 ### 准备账号文件
 
@@ -130,10 +129,7 @@ cd standalone-login
 python login.py
 ```
 
-登录成功后会写入：
-
-- `standalone-login/cookie.txt`
-- 项目根目录 `cookies.txt`
+登录成功后会更新项目根目录 `settings.json` 中的 `cookies` 和 `session_id` 字段，不再生成新的 Cookie 文本文件。
 
 ### 强制重新登录
 
@@ -267,9 +263,9 @@ python -m unittest discover -s tests
 
 优先检查：
 
-1. `cookies.txt` 是否存在。
-2. Cookie 是否过期。
-3. `settings.json` 中 `base_url` 和 `cookie_file` 是否正确。
+1. `settings.json` 中是否存在 `cookies` 和 `session_id`。
+2. Cookie 或 `session_id` 是否过期。
+3. `settings.json` 中 `base_url` 是否正确。
 4. 网络是否能访问课程平台。
 
 可以尝试重新登录：
@@ -323,7 +319,7 @@ chcp 65001
 
 ## 开发注意事项
 
-- 不要提交 `cookies.txt`、`settings.json`、`account.txt` 等敏感文件。
+- 不要提交 `settings.json`、`account.txt` 等敏感文件；旧版生成过的 `cookies.txt`/`cookie.txt` 也不要提交。
 - 不要提交 `downloads/`、`audio/`、`transcripts/` 等大文件目录。
 - 修改爬虫接口前，尽量保持 `CourseCrawler` 的公开方法签名稳定。
 - 下载相关优化优先放在 GUI 调度层或 `performance_utils.py`，避免破坏平台接口逻辑。
@@ -346,4 +342,3 @@ perf(gui): throttle download progress updates
 perf(gui): append downloaded audio incrementally
 perf(gui): index downloaded replay markers
 ```
-

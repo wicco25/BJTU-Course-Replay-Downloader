@@ -40,7 +40,7 @@ class CrawlerReloginTests(unittest.TestCase):
         crawler = CourseCrawler.__new__(CourseCrawler)
         crawler.base_url = "http://example/ve"
         crawler.session_id = session_id
-        crawler.cookie_file = "cookies.txt"
+        crawler.cookies = {"JSESSIONID": "abc"}
         crawler.auto_relogin = True
         crawler._relogin_attempted = False
         crawler.session = FakeSession(responses)
@@ -103,12 +103,16 @@ class CrawlerReloginTests(unittest.TestCase):
         crawler = self.make_crawler([], session_id="")
 
         with patch("crawler.subprocess.run", return_value=SimpleNamespace(returncode=0)):
-            with patch("crawler.load_config", return_value={"session_id": "fresh"}):
+            with patch(
+                "crawler.load_config",
+                return_value={"session_id": "fresh", "cookies": {"JSESSIONID": "new"}},
+            ):
                 with patch.object(crawler, "_load_cookies") as load_cookies:
                     self.assertTrue(crawler._refresh_login())
 
         load_cookies.assert_called_once()
         self.assertEqual(crawler.session_id, "fresh")
+        self.assertEqual(crawler.cookies, {"JSESSIONID": "new"})
 
 
 if __name__ == "__main__":

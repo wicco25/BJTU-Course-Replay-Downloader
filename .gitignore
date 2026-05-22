@@ -12,6 +12,7 @@ __pycache__/
 *.pyo
 
 # 敏感文件（Cookie、账号、本地配置）
+# cookies.txt 和 standalone-login/cookie.txt 是旧版残留输出，继续忽略以防误提交
 cookies.txt
 standalone-login/cookie.txt
 standalone-login/account.txt

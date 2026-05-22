@@ -119,39 +119,57 @@ class CookieReuseTests(unittest.TestCase):
             {"method": "toCoursePlatformIndex"},
         )
 
-    def test_write_project_session_id_merges_existing_settings(self):
+    def test_write_project_auth_state_merges_existing_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             script_dir = Path(tmp) / "standalone-login"
             script_dir.mkdir()
             settings_path = Path(tmp) / "settings.json"
-            settings_path.write_text('{"base_url": "http://example", "session_id": "old"}', encoding="utf-8")
+            settings_path.write_text(
+                '{"base_url": "http://example", "session_id": "old"}',
+                encoding="utf-8",
+            )
 
-            login_mod._write_project_session_id(str(script_dir), "new")
+            login_mod._write_project_auth_state(
+                str(script_dir), "new", {"JSESSIONID": "abc"}
+            )
 
             settings = login_mod.json.loads(settings_path.read_text(encoding="utf-8"))
 
         self.assertEqual(settings["base_url"], "http://example")
         self.assertEqual(settings["session_id"], "new")
+        self.assertEqual(settings["cookies"], {"JSESSIONID": "abc"})
+
+    def test_load_project_cookies_reads_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = Path(tmp) / "standalone-login"
+            script_dir.mkdir()
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(
+                '{"cookies": {"JSESSIONID": "abc"}}',
+                encoding="utf-8",
+            )
+
+            cookies = login_mod._load_project_cookies(str(script_dir))
+
+        self.assertEqual(cookies, {"JSESSIONID": "abc"})
 
     def test_probe_reuses_valid_cookie_without_redirect(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cookie_path = Path(tmp) / "cookie.txt"
-            login_mod._write_cookie_file(str(cookie_path), {"JSESSIONID": "abc"})
-            fake_session = FakeSession([
-                FakeResponse(
-                    status_code=200,
-                    payload={
-                        "STATUS": "0",
-                        "result": [{"xqCode": "2025202602", "currentFlag": 2}],
-                    },
-                ),
-                FakeResponse(status_code=200, payload={"STATUS": "0", "courseList": []}),
-            ])
+        cookies_in = {"JSESSIONID": "abc"}
+        fake_session = FakeSession([
+            FakeResponse(
+                status_code=200,
+                payload={
+                    "STATUS": "0",
+                    "result": [{"xqCode": "2025202602", "currentFlag": 2}],
+                },
+            ),
+            FakeResponse(status_code=200, payload={"STATUS": "0", "courseList": []}),
+        ])
 
-            with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                cookies = login_mod._probe_cookie_valid(
-                    str(cookie_path), "http://example/ve", session_id="sid"
-                )
+        with patch.object(login_mod.requests, "Session", return_value=fake_session):
+            cookies = login_mod._probe_cookie_valid(
+                cookies_in, "http://example/ve", session_id="sid"
+            )
 
         self.assertEqual(cookies, {"JSESSIONID": "abc"})
         self.assertFalse(fake_session.trust_env)
@@ -166,112 +184,102 @@ class CookieReuseTests(unittest.TestCase):
         )
 
     def test_probe_rejects_auth_redirect(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cookie_path = Path(tmp) / "cookie.txt"
-            login_mod._write_cookie_file(str(cookie_path), {"JSESSIONID": "abc"})
-            fake_session = FakeSession([
-                FakeResponse(
-                    status_code=200,
-                    payload={
-                        "STATUS": "0",
-                        "result": [{"xqCode": "2025202602", "currentFlag": 2}],
-                    },
-                ),
-                FakeResponse(status_code=302, location="https://cas.bjtu.edu.cn/auth/login/"),
-            ])
+        cookies_in = {"JSESSIONID": "abc"}
+        fake_session = FakeSession([
+            FakeResponse(
+                status_code=200,
+                payload={
+                    "STATUS": "0",
+                    "result": [{"xqCode": "2025202602", "currentFlag": 2}],
+                },
+            ),
+            FakeResponse(status_code=302, location="https://cas.bjtu.edu.cn/auth/login/"),
+        ])
 
-            with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                cookies = login_mod._probe_cookie_valid(
-                    str(cookie_path), "http://example/ve", session_id="sid"
-                )
+        with patch.object(login_mod.requests, "Session", return_value=fake_session):
+            cookies = login_mod._probe_cookie_valid(
+                cookies_in, "http://example/ve", session_id="sid"
+            )
 
         self.assertEqual(cookies, {})
 
     def test_probe_rejects_html_login_page_with_200(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cookie_path = Path(tmp) / "cookie.txt"
-            login_mod._write_cookie_file(str(cookie_path), {"JSESSIONID": "abc"})
-            fake_session = FakeSession([
-                FakeResponse(
-                    status_code=200,
-                    payload={
-                        "STATUS": "0",
-                        "result": [{"xqCode": "2025202602", "currentFlag": 2}],
-                    },
-                ),
-                FakeResponse(status_code=200, text="<html>login</html>"),
-            ])
+        cookies_in = {"JSESSIONID": "abc"}
+        fake_session = FakeSession([
+            FakeResponse(
+                status_code=200,
+                payload={
+                    "STATUS": "0",
+                    "result": [{"xqCode": "2025202602", "currentFlag": 2}],
+                },
+            ),
+            FakeResponse(status_code=200, text="<html>login</html>"),
+        ])
 
-            with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                cookies = login_mod._probe_cookie_valid(
-                    str(cookie_path), "http://example/ve", session_id="sid"
-                )
+        with patch.object(login_mod.requests, "Session", return_value=fake_session):
+            cookies = login_mod._probe_cookie_valid(
+                cookies_in, "http://example/ve", session_id="sid"
+            )
 
         self.assertEqual(cookies, {})
 
     def test_probe_rejects_api_status_failure(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cookie_path = Path(tmp) / "cookie.txt"
-            login_mod._write_cookie_file(str(cookie_path), {"JSESSIONID": "abc"})
-            fake_session = FakeSession([
-                FakeResponse(
-                    status_code=200,
-                    payload={
-                        "STATUS": "0",
-                        "result": [{"xqCode": "2025202602", "currentFlag": 2}],
-                    },
-                ),
-                FakeResponse(status_code=200, payload={"STATUS": "1", "MSG": "expired"}),
-            ])
+        cookies_in = {"JSESSIONID": "abc"}
+        fake_session = FakeSession([
+            FakeResponse(
+                status_code=200,
+                payload={
+                    "STATUS": "0",
+                    "result": [{"xqCode": "2025202602", "currentFlag": 2}],
+                },
+            ),
+            FakeResponse(status_code=200, payload={"STATUS": "1", "MSG": "expired"}),
+        ])
 
-            with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                cookies = login_mod._probe_cookie_valid(
-                    str(cookie_path), "http://example/ve", session_id="sid"
-                )
+        with patch.object(login_mod.requests, "Session", return_value=fake_session):
+            cookies = login_mod._probe_cookie_valid(
+                cookies_in, "http://example/ve", session_id="sid"
+            )
 
         self.assertEqual(cookies, {})
 
     def test_probe_rejects_course_endpoint_server_error(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cookie_path = Path(tmp) / "cookie.txt"
-            login_mod._write_cookie_file(str(cookie_path), {"JSESSIONID": "abc"})
-            fake_session = FakeSession([
-                FakeResponse(
-                    status_code=200,
-                    payload={
-                        "STATUS": "0",
-                        "result": [{"xqCode": "2025202602", "currentFlag": 2}],
-                    },
-                ),
-                FakeResponse(status_code=500, text="java.lang.NullPointerException"),
-            ])
+        cookies_in = {"JSESSIONID": "abc"}
+        fake_session = FakeSession([
+            FakeResponse(
+                status_code=200,
+                payload={
+                    "STATUS": "0",
+                    "result": [{"xqCode": "2025202602", "currentFlag": 2}],
+                },
+            ),
+            FakeResponse(status_code=500, text="java.lang.NullPointerException"),
+        ])
 
-            with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                cookies = login_mod._probe_cookie_valid(
-                    str(cookie_path), "http://example/ve", session_id="sid"
-                )
+        with patch.object(login_mod.requests, "Session", return_value=fake_session):
+            cookies = login_mod._probe_cookie_valid(
+                cookies_in, "http://example/ve", session_id="sid"
+            )
 
         self.assertEqual(cookies, {})
 
     def test_probe_uses_supplied_session_id(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cookie_path = Path(tmp) / "cookie.txt"
-            login_mod._write_cookie_file(str(cookie_path), {"JSESSIONID": "abc"})
-            fake_session = FakeSession([
-                FakeResponse(
-                    status_code=200,
-                    payload={
-                        "STATUS": "0",
-                        "result": [{"xqCode": "2025202602", "currentFlag": 2}],
-                    },
-                ),
-                FakeResponse(status_code=200, payload={"STATUS": "0", "courseList": []}),
-            ])
+        cookies_in = {"JSESSIONID": "abc"}
+        fake_session = FakeSession([
+            FakeResponse(
+                status_code=200,
+                payload={
+                    "STATUS": "0",
+                    "result": [{"xqCode": "2025202602", "currentFlag": 2}],
+                },
+            ),
+            FakeResponse(status_code=200, payload={"STATUS": "0", "courseList": []}),
+        ])
 
-            with patch.object(login_mod.requests, "Session", return_value=fake_session):
-                login_mod._probe_cookie_valid(
-                    str(cookie_path), "http://example/ve", session_id="custom"
-                )
+        with patch.object(login_mod.requests, "Session", return_value=fake_session):
+            login_mod._probe_cookie_valid(
+                cookies_in, "http://example/ve", session_id="custom"
+            )
 
         self.assertEqual(fake_session.calls[0][1]["headers"]["sessionId"], "custom")
 

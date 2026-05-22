@@ -34,7 +34,7 @@ class CourseCrawler:
         cfg = load_config()
         self.base_url = cfg["base_url"]
         self.session_id = cfg["session_id"]
-        self.cookie_file = cfg["cookie_file"]
+        self.cookies = cfg.get("cookies", {})
         self.auto_relogin = cfg.get("auto_relogin", True)
         self._relogin_attempted = False
         self.session = requests.Session()
@@ -49,16 +49,11 @@ class CourseCrawler:
 
     def _load_cookies(self):
         self.session.cookies.clear()
-        if os.path.exists(self.cookie_file):
-            with open(self.cookie_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if "=" in line and not line.startswith("#"):
-                        key, value = line.split("=", 1)
-                        self.session.cookies.set(key.strip(), value.strip())
-            print(f"[Crawler] 已加载Cookie: {len(self.session.cookies)} 条")
+        if self.cookies:
+            self.session.cookies.update(self.cookies)
+            print(f"[Crawler] 已加载 Cookie: {len(self.session.cookies)} 条")
         else:
-            print(f"[Crawler] 警告: Cookie文件不存在: {self.cookie_file}")
+            print("[Crawler] 警告: settings.json 中没有 Cookie")
 
     def _api_get(self, path, params=None, extra_headers=None):
         """GET请求（JSON API）"""
@@ -137,8 +132,6 @@ class CourseCrawler:
         cmd = [
             sys.executable,
             script,
-            "--cookie",
-            self.cookie_file,
             "--base-url",
             self.base_url,
         ]
@@ -160,9 +153,10 @@ class CourseCrawler:
             print(f"[Crawler] 自动重新登录失败: {detail}")
             return False
         print("[Crawler] 自动重新登录成功，已重新加载 Cookie")
-        self._load_cookies()
         cfg = load_config()
         self.session_id = cfg.get("session_id", "")
+        self.cookies = cfg.get("cookies", {})
+        self._load_cookies()
         return True
 
     def _get_page(self, path, params=None):

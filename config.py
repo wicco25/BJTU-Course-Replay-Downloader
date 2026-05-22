@@ -6,7 +6,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_CONFIG = {
     "base_url": "http://123.121.147.7:88/ve",
-    "cookie_file": os.path.join(BASE_DIR, "cookies.txt"),
+    "cookies": {},
     "download_dir": os.path.join(BASE_DIR, "downloads"),
     "audio_dir": os.path.join(BASE_DIR, "audio"),
     "transcript_dir": os.path.join(BASE_DIR, "transcripts"),
