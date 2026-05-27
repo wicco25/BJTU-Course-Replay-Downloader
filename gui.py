@@ -387,6 +387,9 @@ class MainWindow(QMainWindow):
         audio_format_info.setStyleSheet(
             "QLabel { border: 1px solid #777; border-radius: 9px; color: #555; font-weight: bold; }"
         )
+        audio_format_info.setToolTip(
+            "优先直接下载服务器音频流（playlist-a1.m3u8），通常比下载完整视频更省流量；若音频流不可用会回退。"
+        )
         audio_format_row.addWidget(audio_format_info)
         audio_format_row.addStretch()
         slayout.addLayout(audio_format_row, 1, 1)

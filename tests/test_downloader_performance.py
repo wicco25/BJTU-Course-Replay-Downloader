@@ -35,6 +35,39 @@ class DownloadDurationTests(unittest.TestCase):
         probe.assert_called_once()
 
 
+class AudioPlaylistUrlTests(unittest.TestCase):
+    def test_audio_playlist_url_replaces_playlist_name(self):
+        downloader = VideoDownloader(FakeCrawler())
+
+        url = downloader._audio_playlist_url("http://example/vod/lesson.mp4/playlist.m3u8")
+
+        self.assertEqual(url, "http://example/vod/lesson.mp4/playlist-a1.m3u8")
+
+    def test_audio_playlist_url_preserves_query_and_fragment(self):
+        downloader = VideoDownloader(FakeCrawler())
+
+        url = downloader._audio_playlist_url(
+            "http://example/vod/lesson.mp4/playlist.m3u8?token=abc#frag"
+        )
+
+        self.assertEqual(
+            url,
+            "http://example/vod/lesson.mp4/playlist-a1.m3u8?token=abc#frag",
+        )
+
+    def test_audio_playlist_url_does_not_rewrite_existing_audio_playlist(self):
+        downloader = VideoDownloader(FakeCrawler())
+
+        url = downloader._audio_playlist_url(
+            "http://example/vod/lesson.mp4/playlist-a1.m3u8?token=abc"
+        )
+
+        self.assertEqual(
+            url,
+            "http://example/vod/lesson.mp4/playlist-a1.m3u8?token=abc",
+        )
+
+
 class ParallelDownloadTests(unittest.TestCase):
     def test_video_download_prefers_parallel_hls(self):
         downloader = VideoDownloader(FakeCrawler())
@@ -74,11 +107,41 @@ class ParallelDownloadTests(unittest.TestCase):
         with patch.object(
             downloader, "_download_hls_parallel", return_value="out.m4a"
         ) as parallel, patch.object(downloader, "_download_audio_with_ffmpeg") as ffmpeg:
-            result = downloader.download_audio_only("http://example/lesson.m3u8", "audio/out.m4a")
+            result = downloader.download_audio_only(
+                "http://example/lesson.mp4/playlist.m3u8",
+                "audio/out.m4a",
+            )
 
         self.assertEqual(result, "out.m4a")
+        self.assertEqual(
+            parallel.call_args.args[0],
+            "http://example/lesson.mp4/playlist-a1.m3u8",
+        )
         self.assertEqual(parallel.call_args.kwargs["media_kind"], "audio")
         ffmpeg.assert_not_called()
+
+    def test_audio_download_falls_back_to_original_video_playlist(self):
+        downloader = VideoDownloader(FakeCrawler())
+        downloader.cfg["use_ytdlp"] = False
+
+        with patch.object(
+            downloader, "_download_hls_parallel", side_effect=[None, "out.m4a"]
+        ) as parallel, patch.object(
+            downloader, "_download_audio_with_ffmpeg", return_value=None
+        ):
+            result = downloader.download_audio_only(
+                "http://example/lesson.mp4/playlist.m3u8",
+                "audio/out.m4a",
+            )
+
+        self.assertEqual(result, "out.m4a")
+        self.assertEqual(
+            [call.args[0] for call in parallel.call_args_list],
+            [
+                "http://example/lesson.mp4/playlist-a1.m3u8",
+                "http://example/lesson.mp4/playlist.m3u8",
+            ],
+        )
 
     def test_segment_workers_are_bounded(self):
         downloader = VideoDownloader(FakeCrawler())
@@ -115,18 +178,44 @@ class ParallelDownloadTests(unittest.TestCase):
         ytdlp.assert_called_once()
         parallel.assert_called_once()
 
-    def test_audio_download_prefers_ytdlp_without_audio_only_url(self):
+    def test_audio_download_prefers_ytdlp_audio_playlist(self):
         downloader = VideoDownloader(FakeCrawler())
         downloader.cfg["use_ytdlp"] = True
 
         with patch.object(
             downloader, "_download_audio_with_ytdlp", return_value="out.m4a"
         ) as ytdlp, patch.object(downloader, "_download_hls_parallel") as parallel:
-            result = downloader.download_audio_only("http://example/lesson.m3u8", "audio/out.m4a")
+            result = downloader.download_audio_only(
+                "http://example/lesson.mp4/playlist.m3u8",
+                "audio/out.m4a",
+            )
 
         self.assertEqual(result, "out.m4a")
-        ytdlp.assert_called_once_with("http://example/lesson.m3u8", "audio/out.m4a", None)
+        ytdlp.assert_called_once_with(
+            "http://example/lesson.mp4/playlist-a1.m3u8",
+            "audio/out.m4a",
+            None,
+        )
         parallel.assert_not_called()
+
+    def test_ytdlp_audio_download_does_not_extract_from_temp_video(self):
+        downloader = VideoDownloader(FakeCrawler())
+
+        with patch.object(
+            downloader, "_download_with_ytdlp", return_value="audio/out.m4a"
+        ) as ytdlp, patch.object(downloader, "_extract_audio_from_media") as extract:
+            result = downloader._download_audio_with_ytdlp(
+                "http://example/lesson.mp4/playlist-a1.m3u8",
+                "audio/out.m4a",
+            )
+
+        self.assertEqual(result, "audio/out.m4a")
+        ytdlp.assert_called_once_with(
+            "http://example/lesson.mp4/playlist-a1.m3u8",
+            "audio/out.m4a",
+            None,
+        )
+        extract.assert_not_called()
 
     def test_ytdlp_command_passes_headers_and_fragment_workers(self):
         downloader = VideoDownloader(FakeCrawler())

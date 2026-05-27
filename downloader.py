@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 
@@ -129,6 +129,22 @@ class VideoDownloader:
 
     def download_audio_only(self, m3u8_url, audio_path, progress_callback=None):
         """直接从m3u8拷贝音频流（跳过视频下载步骤）"""
+        audio_m3u8_url = self._audio_playlist_url(m3u8_url)
+        result = self._download_audio_stream(
+            audio_m3u8_url, audio_path, progress_callback
+        )
+        if result:
+            return result
+        if audio_m3u8_url != m3u8_url:
+            print("[Downloader] direct audio playlist failed, fallback to video playlist")
+            return self._download_audio_from_video_stream(
+                m3u8_url, audio_path, progress_callback
+            )
+        return None
+
+    def _download_audio_stream(self, m3u8_url, audio_path,
+                               progress_callback=None):
+        """Download an audio-only HLS playlist directly."""
         if self.cfg.get("use_ytdlp", True):
             result = self._download_audio_with_ytdlp(
                 m3u8_url, audio_path, progress_callback
@@ -144,6 +160,42 @@ class VideoDownloader:
             return result
         print("[Downloader] 并发音频下载失败，回退到ffmpeg顺序下载")
         return self._download_audio_with_ffmpeg(m3u8_url, audio_path, progress_callback)
+
+    def _download_audio_from_video_stream(self, m3u8_url, audio_path,
+                                          progress_callback=None):
+        """Fallback path for servers without playlist-a1.m3u8 support."""
+        if self.cfg.get("use_ytdlp", True):
+            result = self._extract_audio_with_ytdlp(
+                m3u8_url, audio_path, progress_callback
+            )
+            if result:
+                return result
+            print("[Downloader] yt-dlp video audio extraction failed, fallback to parallel HLS")
+        result = self._download_hls_parallel(
+            m3u8_url, audio_path, media_kind="audio",
+            progress_callback=progress_callback,
+        )
+        if result:
+            return result
+        print("[Downloader] video playlist audio extraction failed, fallback to ffmpeg")
+        return self._download_audio_with_ffmpeg(m3u8_url, audio_path, progress_callback)
+
+    @staticmethod
+    def _audio_playlist_url(m3u8_url):
+        parts = urlsplit(m3u8_url)
+        path_prefix, separator, filename = parts.path.rpartition("/")
+        if filename == "playlist-a1.m3u8":
+            return m3u8_url
+        if filename != "playlist.m3u8":
+            return m3u8_url
+        audio_path = f"{path_prefix}{separator}playlist-a1.m3u8"
+        return urlunsplit((
+            parts.scheme,
+            parts.netloc,
+            audio_path,
+            parts.query,
+            parts.fragment,
+        ))
 
     def _download_audio_with_ffmpeg(self, m3u8_url, audio_path, progress_callback=None):
         """使用ffmpeg顺序读取HLS并拷贝音频流。"""
@@ -218,6 +270,13 @@ class VideoDownloader:
 
     def _download_audio_with_ytdlp(self, m3u8_url, audio_path,
                                    progress_callback=None):
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+        return self._download_with_ytdlp(
+            m3u8_url, audio_path, progress_callback
+        )
+
+    def _extract_audio_with_ytdlp(self, m3u8_url, audio_path,
+                                  progress_callback=None):
         os.makedirs(os.path.dirname(audio_path), exist_ok=True)
         temp_video = audio_path + ".source.mp4"
         try:
